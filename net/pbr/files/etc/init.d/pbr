@@ -14,9 +14,10 @@ USE_PROCD=1
 
 readonly packageName='pbr'
 readonly PKG_VERSION='dev-test'
-readonly packageCompat='11'
+readonly packageCompat='13'
 readonly serviceName="$packageName $PKG_VERSION"
 readonly packageConfigFile="/etc/config/${packageName}"
+readonly packageDebugFile="/var/run/${packageName}.debug"
 readonly packageLockFile="/var/run/${packageName}.lock"
 readonly dnsmasqFileDefault="/var/run/${packageName}.dnsmasq"
 readonly _OK_='\033[0;32m\xe2\x9c\x93\033[0m'
@@ -47,7 +48,7 @@ readonly xrayIfacePrefix='xray_'
 readonly rtTablesFile='/etc/iproute2/rt_tables'
 
 # package config options
-procd_boot_timeout=
+debug_dnsmasq=
 enabled=
 fw_mask=
 icmp_interface=
@@ -55,10 +56,8 @@ ignored_interface=
 ipv6_enabled=
 nft_user_set_policy=
 nft_user_set_counter=
-procd_boot_delay=
 procd_reload_delay=
 procd_lan_device=
-procd_wan_ignore_status=
 procd_wan_interface=
 procd_wan6_interface=
 procd_wan6_metric='128'
@@ -94,6 +93,7 @@ ifacesSupported=
 firewallWanZone=
 wanGW4=
 wanGW6=
+pbr_boot_flag=
 serviceStartTrigger=
 processDnsPolicyError=
 processPolicyError=
@@ -180,8 +180,11 @@ pbr_get_gateway6() {
 filter_options() {
 	local opt="$1" values="$2" v _ret
 	for v in $values; do
-		str_contains "$opt" _negative && { is_negation "$v" || continue; }
-		eval "is_$opt" "${v#!}" || continue
+		if str_contains "$opt" '_negative'; then
+			is_negated "$v" || continue
+			opt="${opt/_negative}"
+		fi
+		eval "is_$opt" "${v/\!}" || continue
 		_ret="${_ret:+$_ret }$v"
 	done
 	echo "$_ret"
@@ -214,7 +217,9 @@ uci_get_device() {
 uci_get_protocol() { uci_get 'network' "$1" 'proto'; }
 is_default_dev() { [ "$1" = "$(ip -4 r | grep -m1 'dev' | grep -Eso 'dev [^ ]*' | awk '{print $2}')" ]; }
 is_disabled_interface() { [ "$(uci_get 'network' "$1" 'disabled')" = '1' ]; }
-is_domain(){ echo "$1" | grep -qE '^([a-zA-Z0-9][a-zA-Z0-9-]{0,61}\.)*[a-zA-Z]{2,}$'; }
+is_host() { echo "$1" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,61}[a-zA-Z0-9]$|^[a-zA-Z0-9]$'; }
+is_hostname() { echo "$1" | grep -qE '^([a-zA-Z0-9]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'; }
+is_domain() { ! is_ipv4 "$1" && ! is_mac_address_bad_notation "$1" && { is_host "$1" || is_hostname "$1"; }; }
 is_dslite() { local p; network_get_protocol p "$1"; [ "${p:0:6}" = "dslite" ]; }
 is_family_mismatch() { ( is_ipv4 "${1//!}" && is_ipv6 "${2//!}" ) || ( is_ipv6 "${1//!}" && is_ipv4 "${2//!}" ); }
 is_greater() { test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"; }
@@ -222,7 +227,7 @@ is_greater_or_equal() { test "$(printf '%s\n' "$@" | sort -V | head -n '1')" = "
 is_ignored_interface() { str_contains_word "$ignored_interface" "$1"; }
 is_ignore_target() { [ "$(str_to_lower "$1")" = 'ignore' ]; }
 is_integer() { case "$1" in ''|*[!0-9]*) return 1;; esac; }
-is_ipv4() { expr "${1%/*}" : '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' >/dev/null; }
+is_ipv4() { echo "$1" | grep -qE '^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(/(3[0-2]|[12]?[0-9]))?$'; }
 is_ipv6() { ! is_mac_address "$1" && str_contains "$1" ':'; }
 is_ipv6_global_scope() { [ "${1:0:4}" = '2001' ]; }
 is_ipv6_local_scope() { is_ipv6_local_link "$1" || is_ipv6_local_unique "$1"; }
@@ -231,8 +236,9 @@ is_ipv6_local_unique() { [ "${1:0:2}" = 'fc' ] || [ "${1:0:2}" = 'fd' ]; }
 is_list() { str_contains "$1" ',' || str_contains "$1" ' '; }
 is_lan() { local d; network_get_device d "$1"; str_contains "$procd_lan_device" "$d"; }
 is_l2tp() { local p; network_get_protocol p "$1"; [ "${p:0:4}" = "l2tp" ]; }
-is_mac_address() { expr "$1" : '[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]$' >/dev/null; }
-is_negation() { [ "${1:0:1}" = '!' ]; }
+is_mac_address() { echo "$1" | grep -qE '^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$'; }
+is_mac_address_bad_notation() { echo "$1" | grep -qE '^([0-9A-Fa-f]{2}-){5}([0-9A-Fa-f]{2})$'; }
+is_negated() { [ "${1:0:1}" = '!' ]; }
 is_netifd_table() { grep -q "ip.table.*$1" /etc/config/network; }
 is_netifd_table_interface() { local iface="$1"; [ "$(uci_get 'network' "$iface" 'ip4table')" = "${packageName}_${iface%6}" ]; }
 is_oc() { local p; network_get_protocol p "$1"; [ "${p:0:11}" = "openconnect" ]; }
@@ -310,6 +316,12 @@ check_dnsmasq_nftset() {
 	check_nft || return 1
 	check_dnsmasq || return 1
 	o="$(dnsmasq -v 2>/dev/null)"
+	[ -n "$debug_dnsmasq" ] && { 
+		echo " $(date) dnsmasq output dump:";
+# shellcheck disable=SC3003
+		echo  "${o%$'\n'$'\n'This*}"; 
+		echo '-------------------------'; 
+	} >> "$packageDebugFile"
 	! echo "$o" | grep -q 'no-nftset' && echo "$o" | grep -q 'nftset'
 }
 print_json_bool() { json_init; json_add_boolean "$1" "$2"; json_dump; json_cleanup; }
@@ -324,7 +336,7 @@ try() {
 if type extra_command >/dev/null 2>&1; then
 	extra_command 'status' "Generates output required to troubleshoot routing issues
 		Use '-d' option for more detailed output
-		Use '-p' option to automatically upload data under VPR paste.ee account
+		Use '-p' option to automatically upload data under PBR paste.ee account
 			WARNING: while paste.ee uploads are unlisted, they are still publicly available
 		List domain names after options to include their lookup in report"
 	extra_command 'version' 'Show version information'
@@ -336,7 +348,7 @@ else
 # shellcheck disable=SC2034
 	EXTRA_HELP="	status	Generates output required to troubleshoot routing issues
 		Use '-d' option for more detailed output
-		Use '-p' option to automatically upload data under VPR paste.ee account
+		Use '-p' option to automatically upload data under PBR paste.ee account
 			WARNING: while paste.ee uploads are unlisted, they are still publicly available
 		List domain names after options to include their lookup in report"
 fi
@@ -373,6 +385,7 @@ get_text() {
 		errorPolicyProcessUnknownProtocol) r="Unknown protocol in policy '%s'!";;
 		errorPolicyProcessInsertionFailed) r="Insertion failed for both IPv4 and IPv6 for policy '%s'!";;
 		errorPolicyProcessInsertionFailedIpv4) r="Insertion failed for IPv4 for policy '%s'!";;
+		errorPolicyProcessUnknownEntry) r="Unknown entry in policy '%s'!";;
 		errorInterfaceRoutingEmptyValues) r="Received empty tid/mark or interface name when setting up routing!";;
 		errorFailedToResolve) r="Failed to resolve '%s'!";;
 		errorTryFailed) r="Command failed: %s";;
@@ -396,6 +409,7 @@ get_text() {
 		warningBadNftCallsInUserFile) r="Incompatible nft calls detected in user include file, disabling fw4 nft file support.";;
 		warningDnsmasqInstanceNoConfdir) r="Dnsmasq instance '%s' targeted in settings, but it doesn't have its own confdir.";;
 		warningDhcpLanForce) r="Please set 'dhcp.%s.force=1' to speed up service start-up.";;
+		*) r="Unknown error '%s'!";;
 	esac
 	echo "$r"
 }
@@ -442,6 +456,7 @@ load_package_config() {
 	local param="$1"
 	local user_file_check_result i
 	config_load "$packageName"
+	config_get_bool debug_dnsmasq             'config' 'debug_dnsmasq' '0'
 	config_get_bool enabled                   'config' 'enabled' '0'
 	config_get      fw_mask                   'config' 'fw_mask' 'ff0000'
 	config_get      icmp_interface            'config' 'icmp_interface'
@@ -460,10 +475,8 @@ load_package_config() {
 	config_get_bool strict_enforcement        'config' 'strict_enforcement' '1'
 	config_get      supported_interface       'config' 'supported_interface'
 	config_get      verbosity                 'config' 'verbosity' '2'
-	config_get      procd_boot_delay          'config' 'procd_boot_delay' '0'
-	config_get      procd_boot_timeout        'config' 'procd_boot_timeout' '30'
+	config_get      procd_reload_delay        'config' 'procd_reload_delay' '0'
 	config_get      procd_lan_device          'config' 'procd_lan_device'  'br-lan'
-	config_get      procd_wan_ignore_status   'config' 'procd_wan_ignore_status' '1'
 	config_get      procd_wan_interface       'config' 'procd_wan_interface'  'wan'
 	config_get      procd_wan6_interface      'config' 'procd_wan6_interface' 'wan6'
 	config_get      wan_ip_rules_priority     'config' 'wan_ip_rules_priority' '30000'
@@ -478,6 +491,7 @@ load_package_config() {
 	fw_maskXor="$(printf '%#x' "$((fw_mask ^ 0xffffffff))")"
 	fw_maskXor="${fw_maskXor:-0xff00ffff}"
 
+	[ "$debug_dnsmasq" != '1' ]          && unset debug_dnsmasq
 	[ "$nft_rule_counter" != '1' ]       && unset nft_rule_counter
 	[ "$nft_set_auto_merge" != '1' ]     && unset nft_set_auto_merge
 	[ "$nft_set_counter" != '1' ]        && unset nft_set_counter
@@ -506,7 +520,6 @@ load_package_config() {
 		${nft_set_policy:+ policy "$nft_set_policy";} \
 		${nft_set_timeout:+ timeout "$nft_set_timeout";} \
 		"
-
 }
 
 # shellcheck disable=SC2317
@@ -610,10 +623,10 @@ load_network() {
 
 	case "$param" in
 		on_boot|on_start)
-			[ -n "$wanIface4" ] && output 2 "Using wan interface (${param}): $wanIface4 \n"
-			[ -n "$wanGW4" ] && output 2 "Found wan gateway (${param}): $wanGW4 \n"
-			[ -n "$wanIface6" ] && output 2 "Using wan6 interface (${param}): $wanIface6 \n"
-			[ -n "$wanGW6" ] && output 2 "Found wan6 gateway (${param}): $wanGW6 \n"
+			[ -n "$wanIface4" ] && output 2 "Using uplink${wanIface6:+ IPv4} interface (${param}): $wanIface4 $__OK__\n"
+			[ -n "$wanGW4" ] && output 2 "Found uplink${wanIface6:+ IPv4} gateway (${param}): $wanGW4 $__OK__\n"
+			[ -n "$wanIface6" ] && output 2 "Using uplink IPv6 interface (${param}): $wanIface6 $__OK__\n"
+			[ -n "$wanGW6" ] && output 2 "Found uplink IPv6 gateway (${param}): $wanGW6 $__OK__\n"
 		;;
 	esac
 	wanGW="${wanGW4:-$wanGW6}"
@@ -621,21 +634,13 @@ load_network() {
 
 is_wan_up() {
 	local sleepCount='1' param="$1"
-	[ "$procd_wan_ignore_status" -eq '1' ] && return 0
-	[ "$param" = 'on_boot' ] || procd_boot_timeout='1'
 	if [ -z "$(uci_get network "$procd_wan_interface")" ]; then
 		state add 'errorSummary' 'errorNoWanInterface' "$procd_wan_interface"
 		state add 'errorSummary' 'errorNoWanInterfaceHint'
 		return 1
 	fi
-	while [ -z "$wanGW" ]; do
-		load_network "$param"
-		if [ "$((sleepCount))" -gt "$((procd_boot_timeout))" ] || [ -n "$wanGW" ]; then break; fi
-		output "$serviceName waiting for $procd_wan_interface gateway...\n"
-		sleep 1
-		network_flush_cache
-		sleepCount=$((sleepCount+1))
-	done
+	network_flush_cache
+	load_network "$param"
 	if [ -n "$wanGW" ]; then
 		return 0
 	else
@@ -842,16 +847,16 @@ cleanup_sets() {
 }
 
 state() {
-	local action="$1" param="$2" value="${3//#/_}"
-	local array_name
-	shift 3
-# shellcheck disable=SC2124
-	local extras="$@"
-	local line error_id error_extra label
+	local action="$1" param="$2"
+	shift 2
+	local value="$*"
+	local line error_id error_extra array_name label
 	case "$action" in
 		add)
-			line="$(eval echo "\$$param")"
-			eval "$param"='${line:+$line#}${value}${extras:+ $extras}'
+			line="$(eval echo "\"\$$param\"")"
+			value="${line:+$line\n}${value}"
+# shellcheck disable=SC3037
+			eval "$param=\"$(echo -e "$value")\""
 		;;
 		json)
 			json_init
@@ -863,10 +868,10 @@ state() {
 					array_name='warnings';;
 			esac
 			json_add_array "$array_name"
-			if [ -n "$(eval echo "\$$param")" ]; then
+			if [ -n "$(eval echo "\"\$$param\"")" ]; then
 				while read -r line; do
 					if str_contains "$line" ' '; then
-						error_id="${line% *}"
+						error_id="${line%% *}"
 						error_extra="${line#* }"
 					else
 						error_id="$line"
@@ -876,7 +881,7 @@ state() {
 					json_add_string 'extra' "$error_extra"
 					json_close_object
 				done <<EOF
-$(eval echo "\$$param" | tr \# \\n)
+$(eval echo "\"\$$param\"")
 EOF
 			fi
 			json_close_array
@@ -884,7 +889,7 @@ EOF
 			json_dump
 		;;
 		print)
-			[ -z "$(eval echo "\$$param")" ] && return 0
+			[ -z "$(eval echo "\"\$$param\"")" ] && return 0
 			case "$param" in
 				errorSummary)
 					label="${_ERROR_}:";;
@@ -893,7 +898,7 @@ EOF
 			esac
 				while read -r line; do
 					if str_contains "$line" ' '; then
-						error_id="${line% *}"
+						error_id="${line%% *}"
 						error_extra="${line#* }"
 						printf "%b $(get_text "$error_id")\n" "$label" "$error_extra"
 					else
@@ -901,11 +906,11 @@ EOF
 						printf "%b $(get_text "$error_id")\n" "$label"
 					fi
 				done <<EOF
-$(eval echo "\$$param" | tr \# \\n)
+$(eval echo "\"\$$param\"")
 EOF
 		;;
 		set)
-			eval "$param"='${value}${extras:+ $extras}'
+			eval "$param"='$value'
 		;;
 	esac
 }
@@ -962,7 +967,6 @@ resolver() {
 					for d in $value; do
 						nftset 'add_dnsmasq_element' "$iface" "$target" "$type" "$uid" "$name" "$d"
 					done
-#					nftset 'add_dnsmasq_element' "$iface" "$target" "$type" "$uid" "$name" "$(str_to_dnsmsaq_nftset "$value")"
 				;;
 				create_resolver_set)
 					[ -n "$resolver_set_supported" ] || return 1
@@ -973,7 +977,7 @@ resolver() {
 						state add 'errorSummary' 'errorNoNft'
 						return 1
 					fi
-					if ! dnsmasq -v 2>/dev/null | grep -q 'no-nftset' && dnsmasq -v 2>/dev/null | grep -q 'nftset'; then
+					if check_dnsmasq_nftset; then
 						resolver_set_supported='true'
 						return 0
 					else
@@ -1283,7 +1287,7 @@ policy_routing() {
 
 		if [ -n "$dest_addr" ]; then 
 			if [ "${dest_addr:0:1}" = "!" ]; then
-				negation='!='; value="${src_addr//\!}"; nftset_suffix='_neg';
+				negation='!='; value="${dest_addr//\!}"; nftset_suffix='_neg';
 			else
 				unset negation; value="$dest_addr"; unset nftset_suffix;
 			fi
@@ -1516,9 +1520,12 @@ policy_process() {
 
 	# TODO: if only src_addr is set add option 121 to dhcp leases?
 
+	# TODO: check if src_addr and dest_addr do not containt unprocessable values
+
 	local filter_list_src_addr='phys_dev phys_dev_negative mac_address mac_address_negative domain domain_negative ipv4 ipv4_negative ipv6 ipv6_negative'
 	local filter_list_dest_addr='domain domain_negative ipv4 ipv4_negative ipv6 ipv6_negative'
 	local filter_group_src_addr filtered_value_src_addr filter_group_dest_addr filtered_value_dest_addr
+	local processed_value_src_addr processed_value_dest_addr
 	[ -z "$src_addr" ] && filter_list_src_addr='none'
 	for filter_group_src_addr in $filter_list_src_addr; do
 		filtered_value_src_addr="$(filter_options "$filter_group_src_addr" "$src_addr")"
@@ -1534,8 +1541,24 @@ policy_process() {
 							continue
 					fi
 					policy_routing "$name" "$interface" "$filtered_value_src_addr" "$src_port" "$filtered_value_dest_addr" "$dest_port" "$proto" "$chain" "$uid"
+					processed_value_src_addr="${processed_value_src_addr:+$processed_value_src_addr }$filtered_value_src_addr"
+					processed_value_dest_addr="${processed_value_dest_addr:+$processed_value_dest_addr }$filtered_value_dest_addr"
 				fi
 			done
+		fi
+	done
+
+	for i in $src_addr; do
+		if ! str_contains "$processed_value_src_addr" "$i"; then
+			processPolicyError='true'
+			state add 'errorSummary' 'errorPolicyProcessUnknownEntry' "$name: $i"
+		fi
+	done
+
+	for i in $dest_addr; do
+		if ! str_contains "$processed_value_dest_addr" "$i"; then
+			processPolicyError='true'
+			state add 'errorSummary' 'errorPolicyProcessUnknownEntry' "$name: $i"
 		fi
 	done
 
@@ -1762,7 +1785,7 @@ process_interface() {
 
 	if [ "$iface" = 'tor' ]; then 
 		case "$action" in
-			create|reload)
+			create|reload|reload_interface)
 				torDnsPort="$(get_tor_dns_port)"
 				torTrafficPort="$(get_tor_traffic_port)"
 				displayText="${iface}/53->${torDnsPort}/80,443->${torTrafficPort}"
@@ -1774,12 +1797,12 @@ process_interface() {
 		return 0
 	fi
 
-	if is_wg_server "$iface"; then
+	if is_wg_server "$iface" && ! is_ignored_interface "$iface"; then
 		local disabled listen_port
 		disabled="$(uci_get 'network' "$iface" 'disabled')"
 		listen_port="$(uci_get 'network' "$iface" 'listen_port')"
 		case "$action" in
-			create|reload)
+			create|reload|reload_interface)
 				if [ "$disabled" != '1' ] && [ -n "$listen_port" ]; then
 					if [ -n "$wanIface4" ]; then
 						ip rule del sport "$listen_port" table "pbr_${wanIface4}" >/dev/null 2>&1
@@ -1976,13 +1999,10 @@ user_file_process() {
 }
 
 boot() {
-	local procd_boot_delay
-	config_load "$packageName"
-	config_get procd_boot_delay 'config' 'procd_boot_delay' '0'
 	nft_file 'delete'
-	ubus -t 30 wait_for network.interface 2>/dev/null
-	{ is_integer "$procd_boot_delay" && sleep "$procd_boot_delay"; \
-		rc_procd start_service 'on_boot' && service_started 'on_boot'; } &
+#	ubus -t 30 wait_for network.interface 2>/dev/null
+	pbr_boot_flag=1
+	rc_procd start_service 'on_boot' && service_started 'on_boot'
 }
 
 on_firewall_reload() { 
@@ -2010,6 +2030,8 @@ on_interface_reload() {
 start_service() {
 	local resolverStoredHash resolverNewHash i param="$1" reloadedIface
 
+	[ -n "$pbr_boot_flag" ] && return 0
+	[ "$param" = 'on_boot' ] && return 0
 	load_environment "${param:-on_start}" "$(load_validate_config)" || return 1
 	is_wan_up "$param" || return 1
 
@@ -2143,6 +2165,8 @@ start_service() {
 }
 
 service_started() {
+	[ -n "$pbr_boot_flag" ] && return 0
+	[ "$param" = 'on_boot' ] && return 0
 	if nft_file 'exists'; then
 		procd_set_config_changed firewall
 		if nft_file 'exists'; then
@@ -2166,6 +2190,7 @@ service_started() {
 	fi
 }
 
+# shellcheck disable=SC2015
 service_triggers() {
 	local n
 	load_environment 'on_triggers'
@@ -2176,14 +2201,21 @@ service_triggers() {
 		load_validate_policy
 		load_validate_include
 	procd_close_validate
-	procd_open_trigger
-		procd_add_config_trigger "config.change" 'openvpn' "/etc/init.d/${packageName}" reload 'on_openvpn_change'
-		procd_add_config_trigger "config.change" "${packageName}" "/etc/init.d/${packageName}" reload
-		for n in $ifacesSupported; do 
-			procd_add_interface_trigger "interface.*" "$n" "/etc/init.d/${packageName}" on_interface_reload "$n"
-		done
-	procd_close_trigger
-#	procd_add_raw_trigger "interface.*.up" 4000 "/etc/init.d/${packageName}" restart 'on_interface_up'
+	if [ -n "$pbr_boot_flag" ]; then
+		output "Setting trigger (on_boot) "
+		procd_add_raw_trigger "interface.*.up" 5000 "/etc/init.d/${packageName}" start && output_okn || output_failn
+	else
+		procd_open_trigger
+			procd_add_config_trigger "config.change" 'openvpn' "/etc/init.d/${packageName}" reload 'on_openvpn_change'
+			procd_add_config_trigger "config.change" "${packageName}" "/etc/init.d/${packageName}" reload
+			output 1 "Setting interface triggers "
+			for n in $ifacesSupported; do
+				output 2 "Setting interface trigger for $n "
+				procd_add_interface_trigger "interface.*" "$n" "/etc/init.d/${packageName}" on_interface_reload "$n" && output_ok || output_fail
+			done
+			output '\n'
+		procd_close_trigger
+	fi
 	if [ "$serviceStartTrigger" = 'on_start' ]; then
 		output 3 "$serviceName monitoring interfaces: ${ifacesSupported}\n"
 	fi
@@ -2357,6 +2389,7 @@ status_service() {
 # shellcheck disable=SC2120
 load_validate_config() {
 	uci_load_validate "$packageName" "$packageName" "$1" "${2}${3:+ $3}" \
+		'debug_dnsmasq:bool:0' \
 		'enabled:bool:0' \
 		'strict_enforcement:bool:1' \
 		'ipv6_enabled:bool:0' \
@@ -2368,11 +2401,8 @@ load_validate_config() {
 		'icmp_interface:or("", tor, uci("network", "@interface"))' \
 		'ignored_interface:list(or(tor, uci("network", "@interface")))' \
 		'supported_interface:list(or(ignore, tor, regex("xray_.*"), uci("network", "@interface")))' \
-		'procd_boot_delay:integer:0' \
-		'procd_boot_timeout:integer:30' \
 		'procd_reload_delay:integer:0' \
 		'procd_lan_device:list(or(network)):br-lan' \
-		'procd_wan_ignore_status:bool:1' \
 		'procd_wan_interface:network:wan' \
 		'procd_wan6_interface:network:wan6' \
 		'wan_ip_rules_priority:uinteger:30000' \
