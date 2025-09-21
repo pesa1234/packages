@@ -336,9 +336,8 @@ uci_changes() {
 	local PACKAGE="$1"
 	local CONFIG="$2"
 	local OPTION="$3"
-	if [ -s "${UCI_CONFIG_DIR:-/etc/config/}${PACKAGE}" ]; then
-		/sbin/uci ${UCI_CONFIG_DIR:+-c $UCI_CONFIG_DIR} changes "$PACKAGE${CONFIG:+.$CONFIG}${OPTION:+.$OPTION}"
-	fi
+	[ -s "${UCI_CONFIG_DIR:-/etc/config/}${PACKAGE}" ] && \
+	[ -n "$(/sbin/uci ${UCI_CONFIG_DIR:+-c $UCI_CONFIG_DIR} changes "$PACKAGE${CONFIG:+.$CONFIG}${OPTION:+.$OPTION}")" ]
 }
 uci_get_listen_port() {
 	local __tmp
@@ -579,7 +578,7 @@ load_environment() {
 		fi
 		if [ "$(uci_get 'firewall' 'defaults' 'auto_includes')" = '0' ]; then
 			uci_remove 'firewall' 'defaults' 'auto_includes'
-			uci_commit firewall
+			uci_commit 'firewall'
 		fi
 		if [ "$(readlink /sbin/ip)" != "$ip_full" ]; then
 			json add error 'errorRequiredBinaryMissing' 'ip-full'
@@ -1058,6 +1057,7 @@ resolver() {
 				;;
 				compare_hash)
 					[ -z "$resolverSetSupported" ] && return 1
+					uci_changes 'dhcp' && uci_commit 'dhcp' 
 					local resolverNewHash
 					if [ -s "$packageDnsmasqFile" ]; then
 						resolverNewHash="$(md5sum "$packageDnsmasqFile" | awk '{ print $1; }')"
@@ -1959,11 +1959,11 @@ process_interface() {
 					output_fail
 				fi
 			else
+				json_add_gateway 'skip_interface' "$ifaceTableID" "$ifaceMark" "$iface" "$gw4" "$dev" "$gw6" "$dev6" "$ifacePriority" "$dispStatus"
 				gatewaySummary="${gatewaySummary}${displayText}${dispStatus:+ $dispStatus}\n"
 			fi
 		;;
 	esac
-#	ifaceTableID="$((ifaceTableID + 1))"
 	ifaceMark="$(printf '0x%06x' $((ifaceMark + uplink_mark)))"
 	ifacePriority="$((ifacePriority - 2))"
 	return $s
@@ -2054,19 +2054,19 @@ start_service() {
 		on_firewall_reload)
 			serviceStartTrigger='on_start'
 		;;
-#		on_interface_reload)
-#			reloadedIface="$2"
-#			local tid pre_init_tid
-#			tid="$(get_rt_tables_id "$reloadedIface")"
-#			pre_init_tid="$(eval echo "\$pre_init_tid_${reloadedIface//-/_}")"
-#			if [ "$tid" = "$pre_init_tid" ]; then
-#				serviceStartTrigger='on_interface_reload'
-#			else
-#				serviceStartTrigger='on_start'
-#				unset reloadedIface
-#			fi
-#		;;
-		on_interface_reload|on_reload)
+		on_interface_reload)
+			reloadedIface="$2"
+			local tid pre_init_tid
+			tid="$(get_rt_tables_id "$reloadedIface")"
+			pre_init_tid="$(eval echo "\$pre_init_tid_${reloadedIface//-/_}")"
+			if [ "$tid" = "$pre_init_tid" ]; then
+				serviceStartTrigger='on_interface_reload'
+			else
+				serviceStartTrigger='on_start'
+				unset reloadedIface
+			fi
+		;;
+		on_reload)
 			serviceStartTrigger='on_reload'
 		;;
 		on_restart)
