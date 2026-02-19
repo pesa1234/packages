@@ -8,13 +8,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=sqm-scripts
-PKG_SOURCE_VERSION:=a56e69388d738f968d97bbb17d1a5fb82965fe88
-PKG_VERSION:=1.7.0
-PKG_RELEASE:=1
+PKG_SOURCE_VERSION:=472fe7655d3100125dbe229eac430dd3cd05d3a8
+PKG_RELEASE:=2
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/tohojo/sqm-scripts
-PKG_MIRROR_HASH:=c382501e5da473a906290c496355a093872d8d07d30a82e261df6e23eb58b5ef
+PKG_SOURCE_URL:=https://github.com/pesa1234/sqm-scripts.git
+PKG_MIRROR_HASH:=3ad5ab63fa69d5f8c28278469ea3acc543cdca8ad16e345fbea1a852275e30d2
 
 PKG_MAINTAINER:=Toke Høiland-Jørgensen <toke@toke.dk>
 PKG_LICENSE:=GPL-2.0-only
