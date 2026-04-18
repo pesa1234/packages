@@ -1,5 +1,10 @@
 #!/bin/sh
 
+if [ "$1" = "cleanup" ]; then
+	script_type=cleanup
+	INTERFACE="$2"
+fi
+
 [ -z "$script_type" ] && {
 	logger -t "openvpn(proto)" -p daemon.warn "hotplug: variable 'script_type' not found"
 	exit
@@ -12,6 +17,8 @@
 
 . /lib/functions.sh
 . /lib/netifd/netifd-proto.sh
+
+SERVER_ROUTE_DIR="/var/run/openvpn-routefix"
 
 mask2prefix() {
 	local mask="$1"
@@ -43,17 +50,110 @@ parse_cidr6() {
 	echo "$addr $plen"
 }
 
+server_route_state_file() {
+	printf '%s/%s.%s\n' "$SERVER_ROUTE_DIR" "${INTERFACE:-openvpn}" "$1"
+}
+
+route_dev_for_gateway() {
+	local family="$1"
+	local gateway="$2"
+	local output gateway_dev
+
+	[ -n "$gateway" ] || return 0
+
+	output="$(ip "-$family" route get "$gateway" 2>/dev/null)" || return 0
+	gateway_dev="$(printf '%s\n' "$output" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+
+	printf '%s\n' "$gateway_dev"
+}
+
+remove_server_route() {
+	local family="$1"
+	local prefix="$2"
+	local target="$3"
+	local gateway="$4"
+	local gateway_dev="$5"
+
+	[ -n "$target" ] || return 0
+	[ -n "$gateway" ] || return 0
+
+	if [ -n "$gateway_dev" ]; then
+		ip "-$family" route del "$target/$prefix" via "$gateway" dev "$gateway_dev" >/dev/null 2>&1 && return 0
+	fi
+
+	ip "-$family" route del "$target/$prefix" via "$gateway" >/dev/null 2>&1 && return 0
+	ip "-$family" route del "$target/$prefix" >/dev/null 2>&1
+
+	return 0
+}
+
+install_server_route() {
+	local family="$1"
+	local prefix="$2"
+	local target="$3"
+	local gateway="$4"
+	local gateway_dev state_file old_target old_gateway old_gateway_dev
+
+	[ -n "$target" ] || return 0
+	[ -n "$gateway" ] || return 0
+	[ "$gateway" != "0.0.0.0" ] || return 0
+	[ "$gateway" != "::" ] || return 0
+
+	mkdir -p "$SERVER_ROUTE_DIR"
+	state_file="$(server_route_state_file "ipv$family")"
+
+	if [ -r "$state_file" ]; then
+		read -r old_target old_gateway old_gateway_dev < "$state_file"
+		if [ "$old_target" != "$target" ] || [ "$old_gateway" != "$gateway" ]; then
+			remove_server_route "$family" "$prefix" "$old_target" "$old_gateway" "$old_gateway_dev"
+		fi
+	fi
+
+	gateway_dev="$(route_dev_for_gateway "$family" "$gateway")"
+
+	if [ -n "$gateway_dev" ] && [ "$gateway_dev" != "$dev" ]; then
+		if ip "-$family" route replace "$target/$prefix" via "$gateway" dev "$gateway_dev" >/dev/null 2>&1; then
+			printf '%s %s %s\n' "$target" "$gateway" "$gateway_dev" > "$state_file"
+		fi
+		return 0
+	fi
+
+	if [ "$gateway_dev" = "$dev" ]; then
+		return 0
+	fi
+
+	if ip "-$family" route replace "$target/$prefix" via "$gateway" >/dev/null 2>&1; then
+		printf '%s %s %s\n' "$target" "$gateway" "" > "$state_file"
+	fi
+
+	return 0
+}
+
+remove_saved_server_routes() {
+	local state_file target gateway gateway_dev
+
+	state_file="$(server_route_state_file ipv4)"
+	if [ -r "$state_file" ]; then
+		read -r target gateway gateway_dev < "$state_file"
+		remove_server_route 4 32 "$target" "$gateway" "$gateway_dev"
+		rm -f "$state_file"
+	fi
+
+	state_file="$(server_route_state_file ipv6)"
+	if [ -r "$state_file" ]; then
+		read -r target gateway gateway_dev < "$state_file"
+		remove_server_route 6 128 "$target" "$gateway" "$gateway_dev"
+		rm -f "$state_file"
+	fi
+}
+
 case "$script_type" in
 	up)
 		proto_init_update "$dev" 1
 
 		[ -n "$ifconfig_local" ] && proto_add_ipv4_address "$ifconfig_local" "${ifconfig_netmask:-255.255.255.255}"
 
-		[ -n "$trusted_ip" ] && {
-			if [ -n "$route_net_gateway" -a "$route_net_gateway" != "0.0.0.0" ]; then
-				proto_add_ipv4_route "$trusted_ip" 32 "$route_net_gateway"
-			fi
-		}
+		install_server_route 4 32 "$trusted_ip" "$route_net_gateway"
 
 		[ -n "$route_vpn_gateway" ] && proto_add_ipv4_route "0.0.0.0" 0 "$route_vpn_gateway"
 
@@ -76,11 +176,7 @@ case "$script_type" in
 				proto_add_ipv6_address "$v6addr" "$v6plen"
 			fi
 
-			[ -n "$trusted_ip6" ] && {
-				if [ -n "$route_ipv6_gateway" -a "$route_ipv6_gateway" != "::" ]; then
-					proto_add_ipv6_route "$trusted_ip6" 128 "$route_ipv6_gateway"
-				fi
-			}
+			install_server_route 6 128 "$trusted_ip6" "$route_ipv6_gateway"
 
 			[ -n "$ifconfig_ipv6_remote" ] && proto_add_ipv6_route "::" 0 "$ifconfig_ipv6_remote"
 
@@ -117,9 +213,24 @@ case "$script_type" in
 		proto_send_update "$INTERFACE"
 	;;
 
+	route-up)
+		install_server_route 4 32 "$trusted_ip" "$route_net_gateway"
+		[ "$IPV6" = "1" ] && install_server_route 6 128 "$trusted_ip6" "$route_ipv6_gateway"
+	;;
+
 	down)
+		remove_saved_server_routes
 		proto_init_update "$dev" 0
 		proto_send_update "$INTERFACE"
+	;;
+
+	route-pre-down)
+		remove_saved_server_routes
+	;;
+
+	cleanup)
+		remove_saved_server_routes
+		exit 0
 	;;
 esac
 

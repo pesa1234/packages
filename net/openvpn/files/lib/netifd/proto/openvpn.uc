@@ -388,6 +388,10 @@ function pid_from_file(path) {
 	return data;
 }
 
+function shell_quote(value) {
+	return "'" + replace(`${value}`, "'", "'\\''") + "'";
+}
+
 function proto_setup(proto) {
 	if (!openvpn_exists()) {
 		warn('OpenVPN binary not found at ' + OPENVPN + '\n');
@@ -448,9 +452,14 @@ function proto_setup(proto) {
 		}
 	}
 
+	let script_security = cfg.script_security;
+	if (script_security == null || script_security === '')
+		script_security = 2;
+
 	// hotplug handler scripts
-	if (cfg.script_security >= 2) {
+	if (script_security >= 2) {
 		push(params, '--setenv', 'INTERFACE', iface);
+		push(params, '--script-security', `${script_security}`);
 		push(params, '--up', '/usr/libexec/openvpn-hotplug');
 		if (cfg.up) push(params, '--setenv', 'user_up', cfg.up);
 		push(params, '--down', '/usr/libexec/openvpn-hotplug');
@@ -525,9 +534,8 @@ function proto_renew(proto) {
 function proto_teardown(proto) {
 	let iface = proto.iface;
 
-	// Allow OpenVPN's down script to process
-
-	sleep(700);
+	system(sprintf('/usr/libexec/openvpn-hotplug cleanup %s', shell_quote(iface)));
+	proto.update_link(false);
 
 	// best-effort cleanup
 	fs.unlink(sprintf(OPENVPN_PASS, iface));
@@ -536,14 +544,7 @@ function proto_teardown(proto) {
 	fs.unlink(sprintf(OPENVPN_PID, iface));
 	fs.unlink(sprintf(OPENVPN_CONF, iface));
 
-	let link_data = {
-		ifname: iface
-	};
-
 	proto.kill_command();
-
-	// remove the link
-	proto.update_link(true, link_data);
 }
 
 netifd.add_proto({
