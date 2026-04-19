@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=nordvpnlite
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/NordSecurity/libtelio.git
@@ -41,6 +41,7 @@ endef
 
 define Package/nordvpnlite/conffiles
 /etc/nordvpnlite/config.json
+/etc/config/nordvpnlite
 endef
 
 define Package/nordvpnlite/install
@@ -48,16 +49,14 @@ define Package/nordvpnlite/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/nordvpnlite $(1)/usr/sbin/
 
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/clis/nordvpnlite/openwrt/feed/net/nordvpnlite/files/nordvpnlite.init \
-		$(1)/etc/init.d/nordvpnlite
+	$(INSTALL_BIN) ./files/nordvpnlite.init $(1)/etc/init.d/nordvpnlite
 
 	$(INSTALL_DIR) $(1)/etc/nordvpnlite
 	$(INSTALL_CONF) $(PKG_BUILD_DIR)/clis/nordvpnlite/openwrt/feed/net/nordvpnlite/files/config.json \
 		$(1)/etc/nordvpnlite/config.json
 
 	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) $(PKG_BUILD_DIR)/clis/nordvpnlite/openwrt/feed/net/nordvpnlite/files/nordvpnlite.conf \
-		$(1)/etc/config/nordvpnlite
+	$(INSTALL_CONF) ./files/nordvpnlite.conf $(1)/etc/config/nordvpnlite
 endef
 
 define Package/nordvpnlite/postinst
