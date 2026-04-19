@@ -129,6 +129,100 @@ install_server_route() {
 	return 0
 }
 
+add_vpn_default_routes() {
+	local gateway="$1"
+
+	[ -n "$gateway" ] || return 1
+
+	proto_add_ipv4_route "0.0.0.0" 1 "$gateway"
+	proto_add_ipv4_route "128.0.0.0" 1 "$gateway"
+
+	return 0
+}
+
+openvpn_dev() {
+	if [ -n "$dev" ]; then
+		printf '%s\n' "$dev"
+		return 0
+	fi
+
+	if command -v ifstatus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+		ifstatus "$INTERFACE" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null && return 0
+		ifstatus "$INTERFACE" 2>/dev/null | jsonfilter -e '@.device' 2>/dev/null && return 0
+	fi
+
+	return 1
+}
+
+remove_vpn_default_routes() {
+	local vpn_dev
+
+	vpn_dev="$(openvpn_dev 2>/dev/null)"
+	[ -n "$vpn_dev" ] || return 0
+
+	ip -4 route del default dev "$vpn_dev" >/dev/null 2>&1
+	ip -4 route del 0.0.0.0/1 dev "$vpn_dev" >/dev/null 2>&1
+	ip -4 route del 128.0.0.0/1 dev "$vpn_dev" >/dev/null 2>&1
+}
+
+add_openvpn_ipv4_routes() {
+	local i net mask gw plen added=1 vpn_default_added=1
+
+	if add_vpn_default_routes "$route_vpn_gateway"; then
+		added=0
+		vpn_default_added=0
+	fi
+
+	i=0
+	while :; do
+		i=$((i+1))
+		eval "net=\$route_network_$i mask=\$route_netmask_$i gw=\$route_gateway_$i"
+		[ -z "$net" ] && break
+		[ -z "$mask" ] && continue
+		if [ "$net" = "0.0.0.0" ] && [ "$mask" = "0.0.0.0" ]; then
+			if add_vpn_default_routes "${gw:-$route_vpn_gateway}"; then
+				added=0
+				vpn_default_added=0
+			fi
+			continue
+		fi
+		if [ "$vpn_default_added" = 0 ] && [ "$mask" = "128.0.0.0" ]; then
+			[ "$net" = "0.0.0.0" ] && continue
+			[ "$net" = "128.0.0.0" ] && continue
+		fi
+
+		plen=$(mask2prefix "$mask")
+		proto_add_ipv4_route "$net" "$plen" "$gw"
+		added=0
+	done
+
+	return "$added"
+}
+
+add_openvpn_ipv6_routes() {
+	local i net gw v6net v6plen added=1
+
+	if [ -n "$ifconfig_ipv6_remote" ]; then
+		proto_add_ipv6_route "::" 0 "$ifconfig_ipv6_remote"
+		added=0
+	fi
+
+	i=0
+	while :; do
+		i=$((i+1))
+		eval "net=\$route_ipv6_network_$i gw=\$route_ipv6_gateway_$i"
+		[ -z "$net" ] && break
+
+		read -r v6net v6plen <<-EOF
+			$(parse_cidr6 "$net" 128)
+		EOF
+		proto_add_ipv6_route "$v6net" "$v6plen" "$gw"
+		added=0
+	done
+
+	return "$added"
+}
+
 remove_saved_server_routes() {
 	local state_file target gateway gateway_dev
 
@@ -155,18 +249,7 @@ case "$script_type" in
 
 		install_server_route 4 32 "$trusted_ip" "$route_net_gateway"
 
-		[ -n "$route_vpn_gateway" ] && proto_add_ipv4_route "0.0.0.0" 0 "$route_vpn_gateway"
-
-		i=0
-		while :; do
-			i=$((i+1))
-			eval "net=\$route_network_$i mask=\$route_netmask_$i gw=\$route_gateway_$i"
-			[ -z "$net" ] && break
-			[ -z "$mask" ] && continue
-
-			plen=$(mask2prefix "$mask")
-			proto_add_ipv4_route "$net" "$plen" "$gw"
-		done
+		add_openvpn_ipv4_routes
 
 		if [ "$IPV6" = "1" ]; then
 			if [ -n "$ifconfig_ipv6_local" ]; then
@@ -178,19 +261,7 @@ case "$script_type" in
 
 			install_server_route 6 128 "$trusted_ip6" "$route_ipv6_gateway"
 
-			[ -n "$ifconfig_ipv6_remote" ] && proto_add_ipv6_route "::" 0 "$ifconfig_ipv6_remote"
-
-			i=0
-			while :; do
-				i=$((i+1))
-				eval "net=\$route_ipv6_network_$i gw=\$route_ipv6_gateway_$i"
-				[ -z "$net" ] && break
-
-				read -r v6net v6plen <<-EOF
-					$(parse_cidr6 "$net" 128)
-				EOF
-				proto_add_ipv6_route "$v6net" "$v6plen" "$gw"
-			done
+			add_openvpn_ipv6_routes
 		fi
 
 		[ -n "$tun_mtu" ] && json_add_int mtu "$tun_mtu"
@@ -214,21 +285,32 @@ case "$script_type" in
 	;;
 
 	route-up)
+		route_update=1
+		proto_init_update "$dev" 1
+		proto_set_keep 1
 		install_server_route 4 32 "$trusted_ip" "$route_net_gateway"
-		[ "$IPV6" = "1" ] && install_server_route 6 128 "$trusted_ip6" "$route_ipv6_gateway"
+		add_openvpn_ipv4_routes && route_update=0
+		if [ "$IPV6" = "1" ]; then
+			install_server_route 6 128 "$trusted_ip6" "$route_ipv6_gateway"
+			add_openvpn_ipv6_routes && route_update=0
+		fi
+		[ "$route_update" = 0 ] && proto_send_update "$INTERFACE"
 	;;
 
 	down)
+		remove_vpn_default_routes
 		remove_saved_server_routes
 		proto_init_update "$dev" 0
 		proto_send_update "$INTERFACE"
 	;;
 
 	route-pre-down)
+		remove_vpn_default_routes
 		remove_saved_server_routes
 	;;
 
 	cleanup)
+		remove_vpn_default_routes
 		remove_saved_server_routes
 		exit 0
 	;;
