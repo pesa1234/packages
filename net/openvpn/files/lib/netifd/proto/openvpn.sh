@@ -56,6 +56,7 @@ option_builder() {
 					;;
 				file)
 					json_get_var v "$f"
+					openvpn_is_hotplug_hook_option "$f" && continue
 					[ -f "$v" ] || continue
 					[ -n "$v" ] && append exec_params "--${f//_/-} '$v'"
 					;;
@@ -86,6 +87,18 @@ option_builder() {
 			esac
 		fi
 	done
+}
+
+openvpn_is_hotplug_hook_option() {
+	case "$1" in
+		up|down|route_up|route_pre_down|ipchange|learn_address|client_connect|\
+		client_crresponse|client_disconnect|auth_user_pass_verify|\
+		tls_crypt_v2_verify|tls_verify)
+			return 0
+		;;
+	esac
+
+	return 1
 }
 
 
@@ -289,8 +302,14 @@ proto_openvpn_renew() {
 
 proto_openvpn_teardown() {
 	local iface="$1"
+	local pid
 
-	/usr/libexec/openvpn-hotplug cleanup "$iface"
+	pid="$(cat "/var/run/openvpn.$iface.pid" 2>/dev/null)"
+	if [ -n "$pid" ]; then
+		daemon_pid="$pid" /usr/libexec/openvpn-hotplug cleanup "$iface"
+	else
+		/usr/libexec/openvpn-hotplug cleanup "$iface" 1
+	fi
 	proto_init_update "*" 0
 	proto_send_update "$iface"
 
