@@ -61,17 +61,35 @@ server_route_state_file() {
 	printf '%s/%s.%s\n' "$SERVER_ROUTE_DIR" "${INTERFACE:-openvpn}" "$1"
 }
 
-route_dev_for_gateway() {
+route_path_for_target() {
 	local family="$1"
-	local gateway="$2"
-	local output gateway_dev
+	local target="$2"
+	local output key
 
-	[ -n "$gateway" ] || return 0
+	route_path_gateway=
+	route_path_dev=
 
-	output="$(ip "-$family" route get "$gateway" 2>/dev/null)" || return 0
-	gateway_dev="$(printf '%s\n' "$output" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+	[ -n "$target" ] || return 1
 
-	printf '%s\n' "$gateway_dev"
+	output="$(ip "-$family" route get "$target" 2>/dev/null)" || return 1
+
+	set -- $output
+	while [ "$#" -gt 0 ]; do
+		key="$1"
+		case "$key" in
+			via)
+				shift
+				route_path_gateway="$1"
+			;;
+			dev)
+				shift
+				route_path_dev="$1"
+			;;
+		esac
+		[ "$#" -gt 0 ] && shift
+	done
+
+	[ -n "$route_path_gateway$route_path_dev" ]
 }
 
 remove_server_route() {
@@ -82,13 +100,19 @@ remove_server_route() {
 	local gateway_dev="$5"
 
 	[ -n "$target" ] || return 0
-	[ -n "$gateway" ] || return 0
 
-	if [ -n "$gateway_dev" ]; then
+	if [ -n "$gateway" ] && [ -n "$gateway_dev" ]; then
 		ip "-$family" route del "$target/$prefix" via "$gateway" dev "$gateway_dev" >/dev/null 2>&1 && return 0
 	fi
 
-	ip "-$family" route del "$target/$prefix" via "$gateway" >/dev/null 2>&1 && return 0
+	if [ -n "$gateway" ]; then
+		ip "-$family" route del "$target/$prefix" via "$gateway" >/dev/null 2>&1 && return 0
+	fi
+
+	if [ -n "$gateway_dev" ]; then
+		ip "-$family" route del "$target/$prefix" dev "$gateway_dev" >/dev/null 2>&1 && return 0
+	fi
+
 	ip "-$family" route del "$target/$prefix" >/dev/null 2>&1
 
 	return 0
@@ -194,7 +218,7 @@ read_server_route_state() {
 	json_get_var route_state_pid daemon_pid
 
 	[ -n "$route_state_target" ] || return 1
-	[ -n "$route_state_gateway" ] || return 1
+	[ -n "$route_state_gateway$route_state_gateway_dev" ] || return 1
 
 	return 0
 }
@@ -203,54 +227,72 @@ install_server_route() {
 	local family="$1"
 	local prefix="$2"
 	local target="$3"
-	local gateway="$4"
-	local gateway_dev state_file
+	local gateway
+	local gateway_dev state_file state_loaded=0
 
-	# OpenVPN resolves the pre-tunnel gateway before --route-noexec stops it
-	# from installing routes. Keep a host route to the VPN peer via that
-	# gateway so a pushed default route does not loop transport packets into
-	# the tunnel itself.
+	# Keep a host route to the VPN peer before netifd installs pushed default
+	# routes. Resolve the peer path itself rather than assuming the default
+	# route gateway also reaches the peer.
 	[ -n "$target" ] || return 0
-	[ -n "$gateway" ] || return 0
-	[ "$gateway" != "0.0.0.0" ] || return 0
-	[ "$gateway" != "::" ] || return 0
 
 	mkdir -p "$SERVER_ROUTE_DIR"
 	state_file="$(server_route_state_file "ipv$family")"
 
 	if [ -r "$state_file" ]; then
-		read_server_route_state "$state_file" || rm -f "$state_file"
-		server_route_state_is_newer "$route_state_start" "$route_state_pid" && return 0
-		if [ "$route_state_target" != "$target" ] || [ "$route_state_gateway" != "$gateway" ]; then
+		if read_server_route_state "$state_file"; then
+			state_loaded=1
+			server_route_state_is_newer "$route_state_start" "$route_state_pid" && return 0
+		else
+			rm -f "$state_file"
+		fi
+	fi
+
+	if route_path_for_target "$family" "$target"; then
+		gateway="$route_path_gateway"
+		gateway_dev="$route_path_dev"
+	fi
+
+	if [ "$gateway_dev" = "$dev" ]; then
+		gateway=
+		gateway_dev=
+	fi
+
+	[ -n "$gateway$gateway_dev" ] || return 0
+	[ "$gateway_dev" != "$dev" ] || return 0
+
+	if [ "$state_loaded" = 1 ]; then
+		if [ "$route_state_target" != "$target" ] ||
+			[ "$route_state_gateway" != "$gateway" ] ||
+			[ "$route_state_gateway_dev" != "$gateway_dev" ]; then
 			remove_server_route \
 				"$family" "$prefix" "$route_state_target" \
 				"$route_state_gateway" "$route_state_gateway_dev"
 		fi
 	fi
 
-	gateway_dev="$(route_dev_for_gateway "$family" "$gateway")"
-
 	if [ -n "$gateway_dev" ] && [ "$gateway_dev" != "$dev" ]; then
-		if ip "-$family" route replace "$target/$prefix" via "$gateway" dev "$gateway_dev" >/dev/null 2>&1; then
+		if [ -n "$gateway" ]; then
+			ip "-$family" route replace "$target/$prefix" via "$gateway" dev "$gateway_dev" >/dev/null 2>&1 || return 0
+		else
+			ip "-$family" route replace "$target/$prefix" dev "$gateway_dev" >/dev/null 2>&1 || return 0
+		fi
+		write_server_route_state "$state_file" "$target" "$gateway" "$gateway_dev"
+		return 0
+	fi
+
+	if [ -n "$gateway" ]; then
+		if ip "-$family" route replace "$target/$prefix" via "$gateway" >/dev/null 2>&1; then
 			write_server_route_state "$state_file" "$target" "$gateway" "$gateway_dev"
 		fi
 		return 0
 	fi
 
-	if [ "$gateway_dev" = "$dev" ]; then
-		return 0
-	fi
-
-	# If the gateway lookup did not return a usable device, still try to
-	# install the host route via the pre-tunnel gateway and let the kernel
-	# resolve the egress device.
-	if ip "-$family" route replace "$target/$prefix" via "$gateway" >/dev/null 2>&1; then
-		write_server_route_state "$state_file" "$target" "$gateway" ""
-	fi
-
 	return 0
 }
 
+# OpenVPN exports route_redirect_gateway_ipv4 when redirect-gateway requests
+# IPv4 default route handling; 1 means redirect-gateway and 2 includes
+# block-local. Keep redirect_gateway as a fallback for older OpenVPN.
 redirect_gateway_ipv4_enabled() {
 	[ "$route_redirect_gateway_ipv4" = "1" ] && return 0
 	[ "$route_redirect_gateway_ipv4" = "2" ] && return 0
@@ -259,6 +301,9 @@ redirect_gateway_ipv4_enabled() {
 	return 1
 }
 
+# OpenVPN exports route_redirect_gateway_ipv6 when redirect-gateway requests
+# IPv6 default route handling; 1 means redirect-gateway and 2 includes
+# block-local.
 redirect_gateway_ipv6_enabled() {
 	[ "$route_redirect_gateway_ipv6" = "1" ] && return 0
 	[ "$route_redirect_gateway_ipv6" = "2" ] && return 0
@@ -310,11 +355,11 @@ ipv6_default_route_requested() {
 }
 
 install_needed_ipv4_server_route() {
-	ipv4_default_route_requested && install_server_route 4 32 "$trusted_ip" "$route_net_gateway"
+	ipv4_default_route_requested && install_server_route 4 32 "$trusted_ip"
 }
 
 install_needed_ipv6_server_route() {
-	ipv6_default_route_requested && install_server_route 6 128 "$trusted_ip6" "$route_ipv6_gateway"
+	ipv6_default_route_requested && install_server_route 6 128 "$trusted_ip6"
 }
 
 add_vpn_default_routes() {
