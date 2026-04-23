@@ -479,14 +479,25 @@ function proto_setup(proto) {
 		let ipv6 = cfg.ipv6;
 		if (ipv6 == null || ipv6 === '')
 			ipv6 = 1;
+		let defaultroute = cfg.defaultroute;
+		if (defaultroute == null || defaultroute === '')
+			defaultroute = 1;
+		// Leave OpenVPN's native address handling enabled by default, but keep
+		// route state in netifd by default for routing consumers.
+		let route_noexec;
+		if (cfg.route_noexec == null || cfg.route_noexec === '') {
+			route_noexec = 1;
+			push(params, '--route-noexec');
+		}
+		else {
+			route_noexec = is_true(cfg.route_noexec) ? 1 : 0;
+		}
 
 		push(params, '--setenv', 'INTERFACE', iface);
 		push(params, '--setenv', 'IPV6', `${ipv6}`);
+		push(params, '--setenv', 'DEFAULTROUTE', `${defaultroute}`);
+		push(params, '--setenv', 'NETIFD_ROUTE_NOEXEC', `${route_noexec}`);
 		push(params, '--script-security', `${script_security}`);
-		if (cfg.ifconfig_noexec == null || cfg.ifconfig_noexec === '')
-			push(params, '--ifconfig-noexec');
-		if (cfg.route_noexec == null || cfg.route_noexec === '')
-			push(params, '--route-noexec');
 		push(params, '--up', '/usr/libexec/openvpn-hotplug');
 		if (cfg.up) push(params, '--setenv', 'user_up', cfg.up);
 		push(params, '--down', '/usr/libexec/openvpn-hotplug');
