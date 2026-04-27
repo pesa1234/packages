@@ -244,6 +244,27 @@ server_route_data_available() {
 	[ -n "$SERVER_ROUTE_IPV4_TARGET$SERVER_ROUTE_IPV6_TARGET" ]
 }
 
+add_openvpn_data() {
+	proto_add_data
+	[ -n "$DAEMON_PID" ] && json_add_string daemon_pid "$DAEMON_PID"
+	[ -n "$dev" ] && json_add_string ifname "$dev"
+	add_server_route_data_object \
+		server_route_ipv4 \
+		"$SERVER_ROUTE_IPV4_TARGET" \
+		"$SERVER_ROUTE_IPV4_GATEWAY" \
+		"$SERVER_ROUTE_IPV4_GATEWAY_DEV" \
+		"$SERVER_ROUTE_IPV4_START" \
+		"$SERVER_ROUTE_IPV4_PID"
+	add_server_route_data_object \
+		server_route_ipv6 \
+		"$SERVER_ROUTE_IPV6_TARGET" \
+		"$SERVER_ROUTE_IPV6_GATEWAY" \
+		"$SERVER_ROUTE_IPV6_GATEWAY_DEV" \
+		"$SERVER_ROUTE_IPV6_START" \
+		"$SERVER_ROUTE_IPV6_PID"
+	proto_close_data
+}
+
 add_server_route_data_object() {
 	local name="$1"
 	local target="$2"
@@ -268,22 +289,15 @@ add_server_route_data() {
 
 	# Store the manually installed peer routes in netifd data so later hook
 	# invocations can remove only the route owned by this daemon generation.
-	proto_add_data
-	add_server_route_data_object \
-		server_route_ipv4 \
-		"$SERVER_ROUTE_IPV4_TARGET" \
-		"$SERVER_ROUTE_IPV4_GATEWAY" \
-		"$SERVER_ROUTE_IPV4_GATEWAY_DEV" \
-		"$SERVER_ROUTE_IPV4_START" \
-		"$SERVER_ROUTE_IPV4_PID"
-	add_server_route_data_object \
-		server_route_ipv6 \
-		"$SERVER_ROUTE_IPV6_TARGET" \
-		"$SERVER_ROUTE_IPV6_GATEWAY" \
-		"$SERVER_ROUTE_IPV6_GATEWAY_DEV" \
-		"$SERVER_ROUTE_IPV6_START" \
-		"$SERVER_ROUTE_IPV6_PID"
-	proto_close_data
+	add_openvpn_data
+}
+
+apply_tun_mtu() {
+	[ -n "$dev" ] || return 0
+	[ -n "$tun_mtu" ] || return 0
+	routefix_is_uint "$tun_mtu" || return 0
+
+	/sbin/ip link set dev "$dev" mtu "$tun_mtu"
 }
 
 read_server_route_state() {
@@ -596,6 +610,7 @@ case "$script_type" in
 		install_needed_ipv6_server_route
 
 		proto_init_update "$dev" 1
+		apply_tun_mtu
 
 		# Keep netifd's interface state in sync even when OpenVPN configured the
 		# address itself; otherwise netifd may flush it before OpenVPN adds routes.
@@ -614,8 +629,7 @@ case "$script_type" in
 			add_openvpn_ipv6_routes
 		fi
 
-		[ -n "$tun_mtu" ] && json_add_int mtu "$tun_mtu"
-		add_server_route_data
+		add_openvpn_data
 
 		i=0
 		while :; do
@@ -642,6 +656,7 @@ case "$script_type" in
 		route_update=1
 		proto_init_update "$dev" 1
 		proto_set_keep 1
+		apply_tun_mtu
 		add_openvpn_ipv4_routes && route_update=0
 		if [ "$IPV6" = "1" ]; then
 			add_openvpn_ipv6_routes && route_update=0
