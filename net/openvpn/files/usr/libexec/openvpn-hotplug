@@ -24,6 +24,7 @@ fi
 # for internal state handling.
 DAEMON_START_TIME="${daemon_start_time:-0}"
 DAEMON_PID="${daemon_pid:-}"
+NOHOSTROUTE="$(uci_get network "$INTERFACE" nohostroute)"
 
 SERVER_ROUTE_IPV4_TARGET=
 SERVER_ROUTE_IPV4_GATEWAY=
@@ -436,6 +437,10 @@ route_noexec_enabled() {
 	[ "$NETIFD_ROUTE_NOEXEC" = "1" ]
 }
 
+host_route_enabled() {
+	[ "$NOHOSTROUTE" != "1" ]
+}
+
 ipv4_def1_route() {
 	local net="$1"
 	local mask="$2"
@@ -501,6 +506,7 @@ ipv6_default_route_requested() {
 }
 
 install_needed_ipv4_server_route() {
+	host_route_enabled || return 0
 	route_noexec_enabled || return 0
 	default_route_enabled || return 0
 	if ipv4_default_route_requested || redirect_gateway_ipv4_enabled; then
@@ -509,6 +515,7 @@ install_needed_ipv4_server_route() {
 }
 
 install_needed_ipv6_server_route() {
+	host_route_enabled || return 0
 	route_noexec_enabled || return 0
 	default_route_enabled || return 0
 	ipv6_default_route_requested && install_server_route 6 128 "$trusted_ip6"
