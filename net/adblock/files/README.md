@@ -2,15 +2,45 @@
 
 # DNS based ad/abuse domain blocking
 
+## Table of Contents
+* [Description](#description)
+* [Quick Start](#quick-start)
+* [Main Features](#main-features)
+* [Prerequisites](#prerequisites)
+* [Installation & Usage](#installation-and-usage)
+* [Adblock CLI interface](#adblock-cli-interface)
+* [Adblock Config Options](#adblock-config-options)
+* [Examples](#examples)
+* [Best practice and tweaks](#best-practice-and-tweaks)
+* [Troubleshooting & debug options](#troubleshooting-and-debug-options)
+* [Support](#support)
+* [Removal](#removal)
+* [Donations](#donations)
+
 <a id="description"></a>
 ## Description
 A lot of people already use adblocker plugins within their desktop browsers, but what if you are using your (smart) phone, tablet, watch or any other (wlan) gadget!? Getting rid of annoying ads, trackers and other abuse sites (like facebook) is simple: block them with your router.
 
 When the DNS server on your router receives DNS requests, you will sort out queries that ask for the resource records of ad servers and return a simple `NXDOMAIN`. This is nothing but **N**on-e**X**istent Internet or Intranet domain name, if a domain name cannot be resolved using the DNS server, a condition called the `NXDOMAIN` occurred.
 
+<a id="quick-start"></a>
+## Quick Start
+For a typical setup these few steps are enough to get adblock up and running — see the sections below for details:
+1. Install the LuCI companion package: `apk update && apk add luci-app-adblock` (this pulls in the `adblock` backend as a dependency).
+2. Enable the adblock system service under `System → Startup`, then open LuCI under `Services → Adblock`, tick `Enabled` and (recommended) set a `Startup Trigger Interface` to your WAN interface (avoid IPv6/wan6).
+3. Keep the small, pre-selected default feed selection to start with (e.g. `adguard`, `adguard_tracking` and `certpl`, ≈280K domains).
+4. Start and verify the service:
+
+```sh
+/etc/init.d/adblock start
+/etc/init.d/adblock status
+```
+
+**Please note:** don't blindly enable (too) many feeds at once — on low memory devices this will sooner or later lead to OOM conditions.
+
 <a id="main-features"></a>
 ## Main Features
-* Support of the following fully pre-configured domain blocklist feeds (free for private usage, for commercial use please check their individual licenses)
+Support of the following fully pre-configured domain blocklist feeds (free for private usage, for commercial use please check their individual licenses)
 
 | Feed                | Enabled | Size | Focus            | Information                                                                       |
 | :------------------ | :-----: | :--- | :--------------- | :-------------------------------------------------------------------------------- |
@@ -47,6 +77,8 @@ When the DNS server on your router receives DNS requests, you will sort out quer
 | winspy              |         | S    | win_telemetry    | [Link](https://github.com/crazy-max/WindowsSpyBlocker)                            |
 | yoyo                |         | S    | general          | [Link](https://pgl.yoyo.org/adservers)                                            |
 
+**Please note:** Feeds marked with size **VAR** (`1Hosts`, `hagezi`, `ipfire_dbl`, `stevenblack`, `utcapitole`) additionally require a category selection via the options `adb_hst_feed`, `adb_hag_feed`, `adb_ipf_feed`, `adb_stb_feed` and `adb_utc_feed` (or via the LuCI feed configuration). Without a category the feed is skipped during processing.  
+
 * List of supported and fully pre-configured adblock sources, already active sources are pre-selected.
   <b><em>To avoid OOM errors, please do not select too many lists!</em></b>
   List size information with the respective domain ranges as follows:
@@ -81,7 +113,7 @@ When the DNS server on your router receives DNS requests, you will sort out quer
 * Provides a detailed DNS Report with DNS related information about client requests, top (blocked) domains and more
 * Provides a powerful search function to quickly find blocked (sub-)domains, e.g. to allow certain domains
 * Implements a jail mode - only domains on the allowlist are permitted, all other DNS requests are rejected
-* Automatic blocklist backup & restore, these backups will be used in case of download errors and during startup
+* Automatic blocklist backup & restore: backups are used on `start`/`restart` and as a fallback on download errors — feeds are only actually refreshed via `reload`
 * Send notification E-Mails, see example configuration below
 * Add new adblock  feeds on your own with the `Custom Feed Editor` in LuCI or via CLI, see example below
 * Strong LuCI support, all relevant options are exposed to the web frontend
@@ -100,6 +132,8 @@ When the DNS server on your router receives DNS requests, you will sort out quer
 * For performance reasons, adblock depends on gnu sort and gawk
 * Before update from former adblock releases please make a backup of your local allow- and blocklists. In the latest adblock these lists have been renamed to `/etc/adblock/adblock.allowlist` and `/etc/adblock/adblock.blocklist`. There is no automatic content transition to the new files.
 * The uci configuration of adblock is automatically migrated during package installation via the uci-defaults mechanism using a housekeeping script
+* Only `reload` actually refreshes the feeds (ETag check plus download of changed feeds). `start`, `restart` — and `boot`/`resume` — restore the existing blocklist backups and only download feeds that have **no** backup yet; they do **not** re-fetch already cached feeds. To update your blocklists (e.g. from a cron job) always use `reload`
+
 
 <a id="installation-and-usage"></a>
 ## Installation & Usage
@@ -134,6 +168,8 @@ Available commands:
 	trace           Start with syscall trace
 	info            Dump procd service info
 ```
+
+The `report` sub-command accepts an output mode: `cli` (default, human-readable table printed to the console), `json` (machine-readable output, incl. GeoIP map data when `adb_map=1`), `mail` (send the report via `msmtp`) and `gen` (regenerate the report data files in the background, used by the LuCI frontend).
 
 <a id="adblock-config-options"></a>
 ## Adblock Config Options
@@ -199,6 +235,11 @@ Available commands:
 | adb_nftbridge        | -, not set                         | enables a temporary DNS bridge to an external DNS resolver during local DNS restarts               |
 | adb_bridgednsv4	     | -, not set                         | external IPv4 DNS resolver used during bridging                                                    |
 | adb_bridgednsv6	     | -, not set                         | external IPv6 DNS resolver used during bridging                                                    |
+| adb_hst_feed         | -, not set                         | category selection for the `1hosts` feed (required to enable it)                                   |
+| adb_hag_feed         | -, not set                         | category selection for the `hagezi` feed (required to enable it)                                   |
+| adb_ipf_feed         | -, not set                         | category selection for the `ipfire_dbl` feed (required to enable it)                               |
+| adb_stb_feed         | -, not set                         | category selection for the `stevenblack` feed (required to enable it)                              |
+| adb_utc_feed         | -, not set                         | category selection for the `utcapitole` feed (required to enable it)                               |
 
 <a id="examples"></a>
 ## Examples
@@ -307,7 +348,7 @@ adblock's firewall rules are based on nftables in a separate isolated nftables t
 This additional firewall feature lets selected client devices temporarily bypass local DNS blocking and use an external, unfiltered DNS resolver. It is designed for situations where a device needs short‑term access to content normally blocked by the adblock rules.
 
 A lightweight CGI endpoint handles the workflow:
-* The client opens the URL, e.g. http(s)://\<ROUTER-IP\>cgi-bin/adblock (preferably transferred via QR code shown in LuCI)
+* The client opens the URL, e.g. http(s)://\<ROUTER-IP\>/cgi-bin/adblock (preferably transferred via QR code shown in LuCI)
 * The script automatically detects the device’s MAC address
 * If the MAC is authorized, the script displays the current status:
   * Not in the nftables set → option to request a temporary allow (“Bypass”)
@@ -327,8 +368,8 @@ Enforces a strict allowlist‑only DNS policy in which only domains listed in th
 By default adblock uses the following pre-configured download options:
 
 ```
-    * curl: --connect-timeout 20 --retry-delay 10 --retry 4 --retry-all-errors --fail --silent --show-error --location -o
-    * wget: --no-cache --no-cookies --timeout=20 --waitretry=10 --tries=5 --retry-connrefused --max-redirect=0 -O
+    * curl: --connect-timeout 20 --retry-delay 10 --retry 4 --retry-max-time 80 --retry-all-errors --fail --silent --show-error --location -o
+    * wget: --no-cache --no-cookies --timeout=20 --waitretry=10 --tries=5 --retry-connrefused -O
     * uclient-fetch: --timeout=20 -O
 ```
 
@@ -356,7 +397,7 @@ password        xxx
 Finally enable E-Mail support, add a valid E-Mail receiver address in LuCI and setup an appropriate cron job.
 
 **Automatic adblock feed updates and E-Mail reports**  
-For a regular, automatic update of the used feeds or other regular adblock tasks set up a cron job. In LuCI you find the cron settings under `System` => `Scheduled Tasks`. On the command line the cron file is located at `/etc/crontabs/root`:
+For a regular, automatic update of the used feeds or other regular adblock tasks set up a cron job. Use `reload` here — `start`/`restart` would only restore the backups instead of fetching fresh feeds. In LuCI you find the cron settings under `System` => `Scheduled Tasks`. On the command line the cron file is located at `/etc/crontabs/root`:  
 
 Example 1
 ```sh
@@ -398,15 +439,21 @@ The rule consist of max. 4 individual, space separated parameters:
 3. column: the domain column within the feed file, e.g. `2` (required)
 4. separator: an optional field separator, default is the character class `[[:space:]]`
 
-**Enable debug mode**  
+<a id="troubleshooting-and-debug-options"></a>
+## Troubleshooting & debug options
 Adblock provides an optional debug mode that writes diagnostic information to the system log and captures internal error output in a dedicated error logfile - by default located in the adblock base directory as `/tmp/adb_error.log`. The log file is automatically cleared at the beginning of each run. Under normal conditions, all error messages are discarded to keep regular runs clean and silent. To enable debug mode, set the option `adb_debug` to `1`. When enabled, the script produces significantly more log output to assist with troubleshooting.
 
+Whenever you encounter adblock related processing problems, please enable debug logging, restart adblock and check the `Log View` tab in LuCI (or the syslog via `logread -e adblock-`).
+
+<a id="support"></a>
 ## Support
 Please join the adblock discussion in this [forum thread](https://forum.openwrt.org/t/adblock-support-thread/507) or contact me by mail <dev@brenken.org>
 
+<a id="removal"></a>
 ## Removal
 Stop all adblock related services with _/etc/init.d/adblock stop_ and remove the adblock package if necessary.
 
+<a id="donations"></a>
 ## Donations
 You like this project - is there a way to donate? Generally speaking "No" - I have a well-paying full-time job and my OpenWrt projects are just a hobby of mine in my spare time.
 
