@@ -1,13 +1,13 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=nordvpnlite
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/NordSecurity/libtelio.git
-PKG_SOURCE_VERSION:=f8537eb230c7b843c0481380070040440fc60609
-PKG_SOURCE_DATE:=2026-06-02
-PKG_MIRROR_HASH:=614a5b8ddfd0a1c3f8c8df0776f44117c022b182b4fc5a896e5a7b14b9ef4f12
+PKG_SOURCE_VERSION:=845384f62d83cb123eb7b2f132e341e3c856235d
+PKG_SOURCE_DATE:=2026-08-07
+PKG_MIRROR_HASH:=8383ea4e5420fa79240096e3d7461f82144c43758f9133d1934978bca7a931cc
 
 MAKE_PATH:=clis/nordvpnlite
 
@@ -25,7 +25,7 @@ include ../../lang/rust/rust-package.mk
 # Upstream build.rs checks for git hooks which don't exist in the build directory
 CARGO_PKG_VARS += BYPASS_LLT_SECRETS=1
 # Short commit hash for the libtelio snapshot above
-CARGO_PKG_VARS += LIBTELIO_COMMIT_SHA=f8537eb2
+CARGO_PKG_VARS += LIBTELIO_COMMIT_SHA=845384f6
 
 define Package/nordvpnlite
   SECTION:=net
