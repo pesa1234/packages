@@ -4,6 +4,10 @@
 //
 // Entry point: module wiring, service lifecycle, policy processing,
 // interface routing, netifd integration, status/rpcd.
+//
+// Two ucode divergences from JavaScript that bite here: for-in over an array
+// yields its values, not its indices (there is no for-of), and function
+// declarations are not hoisted, so a helper must appear before its callers.
 
 // ── Constants & Sub-module Factories ────────────────────────────────
 
@@ -278,9 +282,43 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		return true;
 	}
 	
+	// ── Address Exclusions ──────────────────────────────────────────────
+
+	// nft has no OR between the match expressions of a rule, so every positive
+	// address type a policy names needs a rule of its own -- that is what makes
+	// src_addr/dest_addr a union of sources. Negated entries are the opposite:
+	// they are AND terms and belong ON those rules. Given a rule of its own a
+	// '!10.0.0.22' reads as "everything except 10.0.0.22", a catch-all that
+	// swallows exactly the traffic the policy was meant to leave alone.
+	//
+	// Resolve a policy's negated groups once, into the fragments appended to
+	// every rule it emits. classify_addr() keeps the families apart, so an IPv4
+	// exclusion only ever reaches the IPv4 rule and vice versa. 'matched' feeds
+	// the unknown-entry check in the callers.
+	// First word of an address list with the negation markers stripped, used to
+	// read a rule's address family. is_ipv4()/is_ipv6() do not accept a leading
+	// '!', so the markers have to come off before the family is tested.
+	function bare_first_word(raw) {
+		return V.str_first_word(replace('' + (raw || ''), /!/g, ''));
+	}
+
+	function collect_negations(list, addr, direction, iface, uid, name, use_resolver) {
+		let n4 = '', n6 = '', matched = '';
+		if (!addr) return { n4, n6, matched };
+		for (let fg in split(list, /\s+/)) {
+			let fv = V.filter_options(fg, addr);
+			if (!fv) continue;
+			matched += (matched ? ' ' : '') + fv;
+			let r = nft.classify_addr(fv, direction, iface, uid, name, use_resolver);
+			if (r.param4 && !r.empty4) n4 += (n4 ? ' ' : '') + r.param4;
+			if (r.param6 && !r.empty6) n6 += (n6 ? ' ' : '') + r.param6;
+		}
+		return { n4, n6, matched };
+	}
+
 	// ── DNS Policy Routing ──────────────────────────────────────────────
 	
-	function dns_policy_routing(name, src_addr, dest_dns, uid, dest_dns_port, dest_dns_ipv4, dest_dns_ipv6) {
+	function dns_policy_routing(name, src_addr, dest_dns, uid, dest_dns_port, dest_dns_ipv4, dest_dns_ipv6, src_neg) {
 		let nft_insert = 'add';
 		let protos = ['tcp', 'udp'];
 		let chain = 'dstnat';
@@ -293,22 +331,27 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			return 1;
 		}
 	
-		if (!cfg.ipv6_enabled && V.is_ipv6(V.str_first_word(src_addr))) {
+		// A rule built from exclusions alone has no positive source to take its
+		// family from, so fall back to the negated entries for the guards below
+		// and let the exclusions themselves decide which families to emit.
+		let raw_src = src_addr || (src_neg ? src_neg.matched : '') || '';
+		let first_value = bare_first_word(raw_src);
+		let src_is_v4 = src_addr ? !V.is_ipv6(first_value) : !!(src_neg && src_neg.n4);
+		let src_is_v6 = src_addr ? !V.is_ipv4(first_value) : !!(src_neg && src_neg.n6);
+
+		if (!cfg.ipv6_enabled && V.is_ipv6(first_value)) {
 			process_dns_policy_error = true;
 			push(state.errors, { code: 'errorPolicyProcessNoIpv6', info: name });
 			return 1;
 		}
 	
-		if ((V.is_ipv4(V.str_first_word(src_addr)) && !dest_dns_ipv4) ||
-			(V.is_ipv6(V.str_first_word(src_addr)) && !dest_dns_ipv6)) {
+		if ((V.is_ipv4(first_value) && !dest_dns_ipv4) ||
+			(V.is_ipv6(first_value) && !dest_dns_ipv6)) {
 			process_dns_policy_error = true;
 			push(state.errors, { code: 'errorPolicyProcessMismatchFamily',
-				info: name + ": '" + src_addr + "' '" + dest_dns + "':'" + dest_dns_port + "'" });
+				info: name + ": '" + raw_src + "' '" + dest_dns + "':'" + dest_dns_port + "'" });
 			return 1;
 		}
-	
-		let clean_src = src_addr ? ((substr(src_addr, 0, 1) == '!') ? replace(src_addr, /!/g, '') : src_addr) : '';
-		let first_value = V.str_first_word(clean_src);
 	
 		for (let proto_i in protos) {
 			let param4 = '', param6 = '';
@@ -328,6 +371,18 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				param6 = r.param6;
 				inline_set_ipv4_empty = r.empty4;
 				inline_set_ipv6_empty = r.empty6;
+			} else if (src_neg && (src_neg.n4 || src_neg.n6)) {
+				// Exclusions with no positive source: suppress the family that
+				// carries none of them, or its rule would match every packet.
+				inline_set_ipv4_empty = !src_neg.n4;
+				inline_set_ipv6_empty = !src_neg.n6;
+			}
+
+			// DNS rules already pin their family with 'meta nfproto', so the
+			// exclusions can just be appended to the rule they belong to.
+			if (src_neg) {
+				if (src_neg.n4) param4 += (param4 ? ' ' : '') + src_neg.n4;
+				if (src_neg.n6) param6 += (param6 ? ' ' : '') + src_neg.n6;
 			}
 	
 			let rule_params = cfg._nft_rule_params ? ' ' + cfg._nft_rule_params : '';
@@ -340,12 +395,12 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 	
 			let ipv4_error = false, ipv6_error = false;
 			if (pbr_nft_prev_param4 != param4 && first_value &&
-				!V.is_ipv6(first_value) && !inline_set_ipv4_empty && dest_dns_ipv4) {
+				src_is_v4 && !inline_set_ipv4_empty && dest_dns_ipv4) {
 				if (!nft.nft4(param4)) ipv4_error = true;
 				pbr_nft_prev_param4 = param4;
 			}
 			if (pbr_nft_prev_param6 != param6 && param4 != param6 &&
-				first_value && !V.is_ipv4(first_value) && !inline_set_ipv6_empty && dest_dns_ipv6) {
+				first_value && src_is_v6 && !inline_set_ipv6_empty && dest_dns_ipv6) {
 				if (!nft.nft6(param6)) ipv6_error = true;
 				pbr_nft_prev_param6 = param6;
 			}
@@ -365,7 +420,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 	
 	// ── Policy Routing ──────────────────────────────────────────────────
 	
-	function policy_routing(name, iface, src_addr, src_port, dest_addr, dest_port, proto, chain, uid) {
+	function policy_routing(name, iface, src_addr, src_port, dest_addr, dest_port, proto, chain, uid, src_neg, dest_neg) {
 		let nft_insert = 'add';
 		let nft_table = pkg.nft_table;
 		let nft_prefix = pkg.nft_prefix;
@@ -374,8 +429,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		proto = lc(proto || '');
 		chain = lc(chain || '') || 'prerouting';
 	
+		// A rule built from exclusions alone still has a family; read it off the
+		// negated entries when there is no positive address to read it from.
+		let raw_src = src_addr || (src_neg ? src_neg.matched : '') || '';
+		let raw_dest = dest_addr || (dest_neg ? dest_neg.matched : '') || '';
 		if (!cfg.ipv6_enabled &&
-			(V.is_ipv6(V.str_first_word(src_addr)) || V.is_ipv6(V.str_first_word(dest_addr)))) {
+			(V.is_ipv6(bare_first_word(raw_src)) ||
+			 V.is_ipv6(bare_first_word(raw_dest)))) {
 			process_policy_error = true;
 			push(state.errors, { code: 'errorPolicyProcessNoIpv6', info: name });
 			return 1;
@@ -448,6 +508,11 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				param6 = r.param6;
 				src_inline_set_ipv4_empty = r.empty4;
 				src_inline_set_ipv6_empty = r.empty6;
+			} else if (src_neg && (src_neg.n4 || src_neg.n6)) {
+				// Exclusions with no positive source: suppress the family that
+				// carries none of them, or its rule would match every packet.
+				src_inline_set_ipv4_empty = !src_neg.n4;
+				src_inline_set_ipv6_empty = !src_neg.n6;
 			}
 	
 			if (dest_addr) {
@@ -456,7 +521,31 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				param6 += (param6 ? ' ' : '') + r.param6;
 				dest_inline_set_ipv4_empty = r.empty4;
 				dest_inline_set_ipv6_empty = r.empty6;
+			} else if (dest_neg && (dest_neg.n4 || dest_neg.n6)) {
+				dest_inline_set_ipv4_empty = !dest_neg.n4;
+				dest_inline_set_ipv6_empty = !dest_neg.n6;
 			}
+
+			// An interface or MAC match (and an absent one) reads the same for
+			// both families, so only one rule is emitted for it. A family-
+			// specific exclusion breaks that: the IPv6 copy would carry no
+			// exclusion and re-admit the very IPv4 packets the IPv4 copy just
+			// filtered out. Pin each copy to its family before appending. An
+			// empty positive match needs no guard: the family that carries no
+			// exclusion is already suppressed above.
+			let family_agnostic = (param4 == param6 && param4 != '');
+			let neg4 = src_neg ? src_neg.n4 : '';
+			let neg6 = src_neg ? src_neg.n6 : '';
+			if (dest_neg) {
+				if (dest_neg.n4) neg4 += (neg4 ? ' ' : '') + dest_neg.n4;
+				if (dest_neg.n6) neg6 += (neg6 ? ' ' : '') + dest_neg.n6;
+			}
+			if (family_agnostic && neg4 != neg6) {
+				param4 = 'meta nfproto ipv4' + (param4 ? ' ' + param4 : '');
+				param6 = 'meta nfproto ipv6' + (param6 ? ' ' + param6 : '');
+			}
+			if (neg4) param4 += (param4 ? ' ' : '') + neg4;
+			if (neg6) param6 += (param6 ? ' ' : '') + neg6;
 	
 			if (src_port) {
 				let negation = '', value = src_port;
@@ -592,15 +681,22 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			output.fail(); return 1;
 		}
 	
-		let filter_list = 'phys_dev phys_dev_negative mac_address mac_address_negative domain domain_negative ipv4 ipv4_negative ipv6 ipv6_negative';
+		let filter_list = 'phys_dev mac_address domain ipv4 ipv6';
+		let neg_list = 'phys_dev_negative mac_address_negative domain_negative ipv4_negative ipv6_negative';
+		let src_neg = collect_negations(neg_list, src_addr, 'src', null, null, name, false);
+		let has_positive = false;
 		for (let fg in split(filter_list, /\s+/)) {
 			let filtered = V.filter_options(fg, src_addr);
-			if (src_addr && filtered) {
-				if (V.str_contains(fg, 'ipv4') && !dest_dns_ipv4) continue;
-				if (V.str_contains(fg, 'ipv6') && !dest_dns_ipv6) continue;
-				dns_policy_routing(name, filtered, dest_dns, uid, dest_dns_port, dest_dns_ipv4, dest_dns_ipv6);
-			}
+			if (!filtered) continue;
+			has_positive = true;
+			if (V.str_contains(fg, 'ipv4') && !dest_dns_ipv4) continue;
+			if (V.str_contains(fg, 'ipv6') && !dest_dns_ipv6) continue;
+			dns_policy_routing(name, filtered, dest_dns, uid, dest_dns_port, dest_dns_ipv4, dest_dns_ipv6, src_neg);
 		}
+		// Nothing but exclusions in src_addr: emit the single rule they describe,
+		// 'every source but these'.
+		if (!has_positive && (src_neg.n4 || src_neg.n6))
+			dns_policy_routing(name, '', dest_dns, uid, dest_dns_port, dest_dns_ipv4, dest_dns_ipv6, src_neg);
 	
 		if (process_dns_policy_error) output.fail();
 		else output.ok();
@@ -630,6 +726,41 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			push(state.errors, { code: 'errorPolicyNoInterface', info: name });
 			output.fail(); return 1;
 		}
+		if (net.is_tor(interface_name)) {
+			// Tor is a dstnat redirect, not a routed interface: the rules below
+			// hardcode ports 53/80/443 and force the dstnat chain, so these
+			// options are silently discarded (src_port additionally produces an
+			// invalid rule). Warn rather than reject -- a dest_addr holding
+			// ordinary resolvable domains is a legitimate Tor policy.
+			//
+			// History: these warnings were live from f532ad3 (2022-12-14) until
+			// d2aba93 (2024-02-16) 'better TOR support in nft', which deleted the
+			// dedicated policy_routing_tor_nft()/_iptables() helpers and folded
+			// Tor into policy_routing(). The call sites went with those helpers
+			// and were never re-added -- confirmed with the maintainer that this
+			// was unintentional rather than a deliberate removal. The catalog
+			// strings were left behind in pkg.uc and status.js, unreachable ever
+			// since. Deliberately not restored verbatim: the old
+			// warningTorUnsetParams also told users to unset src_addr, which that
+			// same refactor turned into the correct way to match a Tor policy, so
+			// its wording is now split per option.
+			//
+			// Deliberately NOT warned about: dest_addr, including '.onion'. A
+			// domain dest_addr is a supported Tor policy and works whenever DNS
+			// for the domain reaches Tor. pbr cannot see whether it does -- that
+			// depends on dnsmasq, which on OpenWrt declares '.onion' local via
+			// /usr/share/dnsmasq/rfc6761.conf -- so any such warning would fire
+			// just as loudly on a correct setup as on a broken one. Documented
+			// instead; see the Tor section of the README.
+			if (src_port)
+				push(state.warnings, { code: 'warningTorUnsetSrcPort', info: name });
+			if (dest_port)
+				push(state.warnings, { code: 'warningTorUnsetDestPort', info: name });
+			if (proto)
+				push(state.warnings, { code: 'warningTorUnsetProto', info: name });
+			if (chain && lc(chain) != 'prerouting')
+				push(state.warnings, { code: 'warningTorUnsetChainNft', info: name });
+		}
 		if (!net.is_supported_interface(interface_name) && !net.is_mwan4_strategy(interface_name)) {
 			push(state.errors, { code: 'errorPolicyUnknownInterface', info: name });
 			output.fail(); return 1;
@@ -651,25 +782,48 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		}
 		dest_addr = join(' ', j_parts);
 	
-		let filter_list_src = 'phys_dev phys_dev_negative mac_address mac_address_negative domain domain_negative ipv4 ipv4_negative ipv6 ipv6_negative';
-		let filter_list_dest = 'domain domain_negative ipv4 ipv4_negative ipv6 ipv6_negative';
+		let filter_list_src = 'phys_dev mac_address domain ipv4 ipv6';
+		let filter_list_dest = 'domain ipv4 ipv6';
+		let neg_list_src = 'phys_dev_negative mac_address_negative domain_negative ipv4_negative ipv6_negative';
+		let neg_list_dest = 'domain_negative ipv4_negative ipv6_negative';
 		let processed_src = '', processed_dest = '';
 	
-		if (!src_addr) filter_list_src = 'none';
-		for (let fg_src in split(filter_list_src, /\s+/)) {
-			let fv_src = V.filter_options(fg_src, src_addr);
-			if (!src_addr || (src_addr && fv_src)) {
-				let fl_dest = dest_addr ? filter_list_dest : 'none';
-				for (let fg_dest in split(fl_dest, /\s+/)) {
-					let fv_dest = V.filter_options(fg_dest, dest_addr);
-					if (!dest_addr || (dest_addr && fv_dest)) {
-						if (V.str_contains(fg_src, 'ipv4') && V.str_contains(fg_dest, 'ipv6')) continue;
-						if (V.str_contains(fg_src, 'ipv6') && V.str_contains(fg_dest, 'ipv4')) continue;
-						policy_routing(name, interface_name, fv_src, src_port, fv_dest, dest_port, proto, chain, uid);
-						processed_src += (processed_src ? ' ' : '') + (fv_src || '');
-						processed_dest += (processed_dest ? ' ' : '') + (fv_dest || '');
-					}
-				}
+		// One rule per positive group -- they are the policy's union of sources.
+		let src_groups = [], dest_groups = [];
+		for (let fg in split(filter_list_src, /\s+/)) {
+			let fv = src_addr ? V.filter_options(fg, src_addr) : '';
+			if (!fv) continue;
+			push(src_groups, { fg, fv });
+			processed_src += (processed_src ? ' ' : '') + fv;
+		}
+		for (let fg in split(filter_list_dest, /\s+/)) {
+			let fv = dest_addr ? V.filter_options(fg, dest_addr) : '';
+			if (!fv) continue;
+			push(dest_groups, { fg, fv });
+			processed_dest += (processed_dest ? ' ' : '') + fv;
+		}
+
+		// The exclusions ride along on each of those rules instead of getting
+		// rules of their own.
+		let src_neg = collect_negations(neg_list_src, src_addr, 'src', interface_name, uid, name, true);
+		let dest_neg = collect_negations(neg_list_dest, dest_addr, 'dst', interface_name, uid, name, true);
+		if (src_neg.matched) processed_src += (processed_src ? ' ' : '') + src_neg.matched;
+		if (dest_neg.matched) processed_dest += (processed_dest ? ' ' : '') + dest_neg.matched;
+
+		// No positive entries of a given side (none configured, or nothing but
+		// exclusions) still yields one rule for that side, carrying whatever
+		// exclusions it has.
+		if (!length(src_groups)) push(src_groups, { fg: 'none', fv: '' });
+		if (!length(dest_groups)) push(dest_groups, { fg: 'none', fv: '' });
+
+		// ucode's for-in yields an array's values, not its indices, so each of
+		// these is the { fg, fv } pushed above.
+		for (let src_group in src_groups) {
+			for (let dest_group in dest_groups) {
+				if (V.str_contains(src_group.fg, 'ipv4') && V.str_contains(dest_group.fg, 'ipv6')) continue;
+				if (V.str_contains(src_group.fg, 'ipv6') && V.str_contains(dest_group.fg, 'ipv4')) continue;
+				policy_routing(name, interface_name, src_group.fv, src_port, dest_group.fv, dest_port,
+					proto, chain, uid, src_neg, dest_neg);
 			}
 		}
 	
@@ -911,6 +1065,21 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 	
 	// ── Enumerate Interfaces ────────────────────────────────────────────
 	
+	// The mark chain's name is derived from the mark, so the two must be kept in
+	// step: an interface whose mark is reassigned after the name was built ends up
+	// naming another interface's chain, or one nobody creates. Deriving both from
+	// here makes that structural rather than something each branch remembers.
+	//
+	// 'mark' is a '0x%06x' string. Every caller is already guaranteed one: it is
+	// either iface_mark, built by sprintf() below, or a netifd/mwan4 mark reached
+	// only through a branch that has tested it for truth. No coercion or fallback
+	// here on purpose -- a sentinel name would be created by nobody and routed to
+	// by nothing, turning a loud failure into the silent misroute this exists to
+	// prevent.
+	function mark_chain_name(mark) {
+		return pkg.nft_prefix + '_mark_' + mark;
+	}
+
 	function interface_enumerate() {
 		config.uci_ctx('network', true);
 	
@@ -929,6 +1098,10 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				push(state.errors, { code: 'errorInterfaceMarkOverflow', info: iface });
 				return;
 			}
+			if (+_iface_priority <= 0) {
+				push(state.errors, { code: 'errorInterfacePriorityExhausted', info: iface });
+				return;
+			}
 	
 			let dev4 = net.network_get_device(iface);
 			if (!dev4) dev4 = net.network_get_physdev(iface);
@@ -941,13 +1114,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			if (!dev6) dev6 = dev4;
 	
 			let _mark = iface_mark;
-			let _chain_name = pkg.nft_prefix + '_mark_' + _mark;
+			let _chain_name = mark_chain_name(_mark);
 			let _priority = _iface_priority;
 			let split_uplink_second = false;
 	
 			if (net.is_netifd_interface(iface) && env.netifd_mark[iface]) {
 				_mark = env.netifd_mark[iface];
-				_chain_name = pkg.nft_prefix + '_mark_' + _mark;
+				_chain_name = mark_chain_name(_mark);
 			} else if (net.is_mwan4_interface(iface) && env.mwan4_mark[iface]) {
 				_mark = env.mwan4_mark[iface];
 				_chain_name = env.mwan4_interface_chain[iface];
@@ -955,6 +1128,15 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				if (net.is_uplink4(iface) || net.is_uplink6(iface)) {
 					if (_uplink_mark && _uplink_priority) {
 						_mark = _uplink_mark;
+						// The chain name is derived from the mark above, so it
+						// has to follow the mark here as it does in the netifd
+						// and mwan4 branches. Left stale, the second uplink
+						// names the chain of whichever interface really owns
+						// the mark it no longer uses -- silently routing its
+						// traffic out that interface -- or, when no interface
+						// owns it, names a chain nobody creates, which fails
+						// the ruleset check and installs nothing at all.
+						_chain_name = mark_chain_name(_mark);
 						_priority = _uplink_priority;
 						split_uplink_second = true;
 					} else {
@@ -1038,6 +1220,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 
 	interface_process.create_global_rules = function() {
 		let prio = '' + iface_priority;
+		let priority_exhausted = false;
 		config.uci_ctx('network').foreach('network', 'interface', function(s_iface) {
 			let name = s_iface['.name'];
 			if (net.is_wg_server(name) && !net.is_ignored_interface(name)) {
@@ -1045,6 +1228,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				let listen_port = config.uci_ctx('network').get('network', name, 'listen_port');
 				if (disabled != '1' && listen_port) {
 					if (cfg.uplink_interface4) {
+						if (+prio <= 0) {
+							if (!priority_exhausted) {
+								push(state.errors, { code: 'errorInterfacePriorityExhausted', info: name });
+								priority_exhausted = true;
+							}
+							return;
+						}
 						let tbl = pkg.ip_table_prefix + '_' + cfg.uplink_interface4;
 						system(pkg.ip_full + ' -4 rule del sport ' + listen_port + ' table ' + tbl + ' priority ' + prio + ' 2>/dev/null');
 						sh.ip('-4', 'rule', 'add', 'sport', listen_port, 'table', tbl, 'priority', prio);
@@ -1057,6 +1247,17 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				}
 			}
 		});
+		// prio may have been left at <= 0 by the exhaustion guard above: never
+		// issue an 'ip rule' at priority 0, it collides with the kernel's own
+		// 'from all lookup local' rule (see 12b993766718). Bail out the same
+		// way the tail of this function does: iface_priority stays a string,
+		// and the returned 0 is unused, the sole caller ignores it.
+		if (+prio <= 0) {
+			if (!priority_exhausted)
+				push(state.errors, { code: 'errorInterfacePriorityExhausted', info: pkg.name });
+			iface_priority = prio;
+			return 0;
+		}
 		system(pkg.ip_full + ' -4 rule del priority ' + prio + ' 2>/dev/null');
 		system(pkg.ip_full + ' -4 rule del lookup main suppress_prefixlength ' + cfg.prefixlength + ' 2>/dev/null');
 		sh.try_cmd(state.errors, pkg.ip_full, '-4', 'rule', 'add', 'lookup', 'main', 'suppress_prefixlength',
@@ -1806,7 +2007,19 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		default:
 			nft.resolver.store_hash();
 			nft.resolver.configure();
-			nft.cleanup('main_table', 'rt_tables', 'main_chains', 'sets');
+			// Only the ip-rule/rt_tables state needs tearing down here. The nft
+			// chains and sets must NOT be removed live: everything rebuilt below
+			// is appended to nft_lines and does not reach the kernel until the
+			// 'fw4 -q reload' at the end of nft_file.apply('main'), so deleting
+			// them now leaves a window -- seconds wide on a multi-interface
+			// router -- in which the sets named by dnsmasq's nftset= directives
+			// do not exist. dnsmasq keeps answering across it and logs
+			// 'nftset ... Error: No such file or directory' for every reply that
+			// lands in the gap, and those addresses are never added to the set.
+			// fw4 reload rebuilds the whole inet table atomically from
+			// 30-pbr.nft, so the old chains and sets are replaced regardless --
+			// which is why stop() below likewise cleans only these two.
+			nft.cleanup('main_table', 'rt_tables');
 			nft.nft_file.init('main', iface_registry);
 			output.okn();
 	
@@ -1874,11 +2087,20 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			}
 	
 			start_time = time();
-			nft.nft_file.apply('main');
+			let nft_applied = nft.nft_file.apply('main');
 			end_time = time();
 			output.logger_debug(cfg.debug_performance, '[PERF-DEBUG] Installing nft rules took ' + (end_time - start_time) + 's');
 
+			// Reap sets orphaned by policies that are gone. Only meaningful once
+			// the new ruleset is live, and skipped when it failed to install,
+			// since the sets still in use are then the previous file's.
+			if (nft_applied) nft.cleanup('orphan_sets');
+			// Before the restart below, so addresses re-resolved after it are
+			// not wiped by a flush that follows.
+			if (nft_applied) nft.resolver.flush_changed();
+
 			if (nft.resolver.compare_hash()) nft.resolver.restart();
+			else nft.resolver.flush_cache();
 			break;
 		}
 	
@@ -2333,7 +2555,6 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		result[name] = {
 			enabled: !!cfg.enabled,
 			running: platform.is_running_nft_file(),
-			running_iptables: false,
 			running_nft: nft.is_service_running_nft(),
 			running_nft_file: platform.is_running_nft_file(),
 			version: pkg.version,

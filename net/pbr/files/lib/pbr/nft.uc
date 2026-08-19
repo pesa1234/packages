@@ -21,6 +21,11 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 	let nft_fw4_dump = '';
 	let resolver_working_flag = false;
 	let resolver_stored_hash = '';
+	// Per-set domain lists as of the previous generation of the dnsmasq file,
+	// snapshotted by store_hash() before configure() truncates it. Null means
+	// "no previous generation seen", which is deliberately not the same as
+	// "empty" -- see resolver.flush_changed().
+	let resolver_prev_domains = null;
 	let dnsmasq_ubus = null;
 
 	// Forward declaration (circular: resolveip_to_nftset → resolver → nftset → resolveip_to_nftset)
@@ -433,6 +438,35 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 		return false;
 	};
 
+	// Map each nft set named in a dnsmasq config to the domains routed into it,
+	// as 'domain,domain' sorted so two generations compare as strings. A line is
+	// 'nftset=/<domain>/<spec>[,<spec>...] # <comment>' and each spec ends in the
+	// set name, so one domain can feed several sets and one set many domains.
+	let _parse_dnsmasq_sets = function(content) {
+		let seen = {};
+		for (let line in split('' + (content || ''), '\n')) {
+			if (substr(line, 0, 8) != 'nftset=/') continue;
+			let rest = substr(line, 8);
+			let dpos = index(rest, '/');
+			if (dpos < 0) continue;
+			let domain = substr(rest, 0, dpos);
+			let specs = substr(rest, dpos + 1);
+			let cpos = index(specs, ' #');
+			if (cpos >= 0) specs = substr(specs, 0, cpos);
+			for (let spec in split(specs, ',')) {
+				let parts = split(trim(spec), '#');
+				let name = parts[length(parts) - 1];
+				if (!name) continue;
+				if (!seen[name]) seen[name] = {};
+				seen[name][domain] = true;
+			}
+		}
+		let out = {};
+		for (let name in seen)
+			out[name] = join(',', sort(keys(seen[name])));
+		return out;
+	};
+
 	nftset.add_dnsmasq_element = function(iface, target, type_val, uid, comment, param) {
 		let ns = _nftset_names(iface, target, type_val, uid);
 		if (!ns) return false;
@@ -592,13 +626,15 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 		return _nftset_result(v4_ok, v6_ok);
 	};
 
+	nftset.flush_name = function(name) {
+		return !!name && nft_call('flush', 'set', 'inet', pkg.nft_table, name);
+	};
+
 	nftset.flush = function(iface, target, type_val, uid) {
 		let ns = _nftset_names(iface, target, type_val, uid);
 		if (!ns) return false;
-		let nft_table = pkg.nft_table;
-		let v4_ok = false, v6_ok = false;
-		if (nft_call('flush', 'set', 'inet', nft_table, ns.n4)) v4_ok = true;
-		if (nft_call('flush', 'set', 'inet', nft_table, ns.n6)) v6_ok = true;
+		let v4_ok = nftset.flush_name(ns.n4);
+		let v6_ok = nftset.flush_name(ns.n6);
 		return _nftset_result(v4_ok, v6_ok);
 	};
 
@@ -707,6 +743,51 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 						if (s)
 							nft_call('delete', 'set', 'inet', pkg.nft_table, s);
 					}
+				}
+				break;
+			}
+			case 'orphan_sets': {
+				// Delete only the sets left behind by policies that no longer
+				// exist, leaving the ones the current ruleset still declares.
+				//
+				// This must run AFTER nft_file.apply('main'), never before it.
+				// fw4 flushes the table's rules but keeps the set objects, so a
+				// stale set survives a reload and would otherwise accumulate
+				// until reboot. Deleting sets up front instead -- as this
+				// function's 'sets' action does -- removes the ones still in use
+				// too, and since every replacement only reaches the kernel with
+				// the 'fw4 -q reload' at the end of apply(), that leaves the
+				// targets of dnsmasq's nftset= directives missing for the whole
+				// rebuild. By the time this runs the new ruleset is live, so an
+				// orphan has no rule referencing it and deletes cleanly rather
+				// than failing with EBUSY.
+				let live = get_nft_sets();
+				if (!live) break;
+				// Sets the ruleset just installed, plus any owned by the netifd
+				// file, which is written separately and must not be reaped here.
+				let keep = {};
+				let set_re = regexp('add set inet ' + pkg.nft_table + '\\s+(\\S+)');
+				for (let line in nft_lines) {
+					let m = match(line, set_re);
+					if (m) keep[m[1]] = true;
+				}
+				for (let line in split(readfile(pkg.nft_netifd_file) || '', '\n')) {
+					let m = match(line, set_re);
+					if (m) keep[m[1]] = true;
+				}
+				// Anything the current ruleset does not declare goes, including
+				// the sets of merely disabled policies. Keeping those would let a
+				// disabled policy resume instantly with its addresses already
+				// resolved, but it is not safe: uci recycles auto-generated
+				// section names, so the uid of a deleted policy can be handed to
+				// a different one, which then generates the identical set name
+				// and would inherit the previous policy's addresses -- silently
+				// routing that traffic to the wrong interface. Reaping on the
+				// same reload the policy disappears leaves nothing to adopt.
+				for (let s in split(live, ' ')) {
+					s = trim(s);
+					if (s && !keep[s])
+						nft_call('delete', 'set', 'inet', pkg.nft_table, s);
 				}
 				break;
 			}
@@ -828,12 +909,19 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 		return true;
 	};
 
-	resolver.kill = function() {
+	resolver.flush_cache = function() {
 		switch (cfg.resolver_set) {
 		case '':
 		case 'none':
 			return true;
 		case 'dnsmasq.nftset':
+			// A set that was just recreated comes back empty, but dnsmasq only
+			// writes to an nftset on an upstream reply -- it answers from cache
+			// without touching the set, so the policy stays dead until the
+			// record's TTL runs out. SIGHUP drops the cache without restarting
+			// the daemon or losing a query, so the next lookup refills the set.
+			// Only needed when the config was unchanged: a restart clears the
+			// cache anyway. '-q' keeps killall quiet when dnsmasq is not running.
 			if (env.resolver_set_supported)
 				sh.run('killall -q -s HUP dnsmasq');
 			return true;
@@ -896,8 +984,12 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 				let md5_out = sh.exec('md5sum ' + sh.quote(pkg.dnsmasq_file));
 				let m = match(md5_out, /^(\S+)/);
 				resolver_stored_hash = m ? m[1] : '';
+				// Snapshot which domains fed which set before configure()
+				// truncates the file; flush_changed() diffs against this.
+				resolver_prev_domains = _parse_dnsmasq_sets(readfile(pkg.dnsmasq_file));
 			} else {
 				resolver_stored_hash = '';
+				resolver_prev_domains = null;
 			}
 			return true;
 		}
@@ -930,6 +1022,50 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 			return false;
 		}
 		return false;
+	};
+
+	// Empty the sets whose domain list changed in this generation.
+	//
+	// Set names are keyed on the policy's uid, not on its contents, so editing a
+	// policy's dest_addr reuses the same set. Since #155 stopped deleting live
+	// sets, that set survives the reload with every address the *old* domain
+	// list resolved to still in it, and the policy keeps routing a domain that
+	// is no longer configured anywhere. cleanup('orphan_sets') does not catch
+	// this: the set is still declared by the new ruleset, so it is kept.
+	//
+	// Only sets that existed in the previous generation and whose domain list
+	// actually differs are flushed. Untouched sets keep their addresses, which
+	// is the whole point of #155 -- flushing everything on every reload would
+	// de-route any domain a client still has cached, since nothing re-queries
+	// on its behalf. A set with no previous generation to compare against is
+	// left alone for the same reason.
+	//
+	// This flushes rather than deletes, and runs as a live nft command after
+	// nft_file.apply('main'): the set object never goes away, so dnsmasq's
+	// nftset= target stays valid throughout and no reply lands in a gap. It
+	// must run before resolver.restart(), so that addresses re-resolved after
+	// the restart are not wiped by a later flush.
+	resolver.flush_changed = function() {
+		switch (cfg.resolver_set) {
+		case '':
+		case 'none':
+			return true;
+		case 'dnsmasq.nftset': {
+			if (!env.resolver_set_supported) return true;
+			if (resolver_prev_domains == null) return true;
+			let now = _parse_dnsmasq_sets(readfile(pkg.dnsmasq_file));
+			for (let name in now) {
+				if (!exists(resolver_prev_domains, name)) continue;
+				if (resolver_prev_domains[name] == now[name]) continue;
+				if (nftset.flush_name(name))
+					output.verbose.write("Flushed '" + name + "' - its domain list changed\n");
+			}
+			return true;
+		}
+		case 'unbound.nftset':
+			return true;
+		}
+		return true;
 	};
 
 	resolver.configure = function() {
@@ -1028,6 +1164,16 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 			value = replace(value, /!/g, '');
 			nftset_suffix = '_neg';
 		}
+		// The negated group of a policy needs its own resolver set: it holds a
+		// different list of domains than the policy's positive group, and both
+		// are keyed on the same uid. Fold the suffix into the uid so the set
+		// that gets created and populated is the very one the rule references.
+		// A falsy uid is passed through untouched: only the resolver branch
+		// below consumes this, and the one caller that passes no uid -- the DNS
+		// path, with use_resolver false -- never reaches it, so there is no set
+		// name to suffix.
+		let set_uid = uid;
+		if (uid && nftset_suffix) set_uid = '' + uid + nftset_suffix;
 		let first_val = V.str_first_word(value);
 		let param4 = '', param6 = '';
 		let empty4 = false, empty6 = false;
@@ -1044,13 +1190,12 @@ function create_nft(fs_mod, config, sh, output, pkg, platform, network, V, state
 			param6 = param4;
 		} else if (V.is_domain(first_val)) {
 			if (use_resolver && iface &&
-				resolver.create_set(iface, target, 'ip', uid, name) &&
-				resolver.add_element(iface, target, 'ip', uid, name, value)) {
-				let nft_pfx = pkg.nft_prefix;
+				resolver.create_set(iface, target, 'ip', set_uid, name) &&
+				resolver.add_element(iface, target, 'ip', set_uid, name, value)) {
 				param4 = pkg.nft_ipv4_flag + ' ' + addr_dir + ' ' + negation +
-					'@' + nft_pfx + '_' + iface + '_4_' + target + '_ip_' + uid + nftset_suffix;
+					'@' + get_set_name(iface, '4', target, 'ip', set_uid);
 				param6 = pkg.nft_ipv6_flag + ' ' + addr_dir + ' ' + negation +
-					'@' + nft_pfx + '_' + iface + '_6_' + target + '_ip_' + uid + nftset_suffix;
+					'@' + get_set_name(iface, '6', target, 'ip', set_uid);
 			} else {
 				let is4 = '', is6 = '';
 				for (let d in split(value, /\s+/)) {
