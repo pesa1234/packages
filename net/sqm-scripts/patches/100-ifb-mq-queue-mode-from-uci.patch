@@ -1,8 +1,8 @@
 diff --git a/src/functions.sh b/src/functions.sh
-index a0b3f59..05d0fea 100644
+index 43d5d5c..13c8457 100644
 --- a/src/functions.sh
 +++ b/src/functions.sh
-@@ -354,13 +354,35 @@ create_ifb() {
+@@ -282,13 +282,35 @@ create_ifb() {
      local name
      local args
      local num_procs
@@ -40,12 +40,10 @@ index a0b3f59..05d0fea 100644
      $IP link add name $name $args type ifb
  }
 diff --git a/src/run-openwrt.sh b/src/run-openwrt.sh
-index eafda37..d6dceec 100644
+index d735a2f..aa25ae7 100644
 --- a/src/run-openwrt.sh
 +++ b/src/run-openwrt.sh
-@@ -19,7 +19,12 @@ CLEANUP=0
- if [ "$ACTION" = "cleanup" ]; then
-     CLEANUP=1
+@@ -22,5 +22,10 @@ if [ "$ACTION" = "cleanup" ]; then
      ACTION=stop
  fi
 +
@@ -56,8 +54,7 @@ index eafda37..d6dceec 100644
  
  check_state_dir
  [ -d "${SQM_QDISC_STATE_DIR}" ] || ${SQM_LIB_DIR}/update-available-qdiscs
-@@ -66,7 +70,11 @@ start_sqm_section() {
-     export TARGET=$(config_get "$section" target)
+@@ -67,6 +72,10 @@ start_sqm_section() {
      export QDISC=$(config_get "$section" qdisc)
      export SCRIPT=$(config_get "$section" script)
      export USE_MQ=$(config_get "$section" use_mq)
