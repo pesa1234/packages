@@ -283,7 +283,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 	}
 	
 	// ── Address Exclusions ──────────────────────────────────────────────
-
+	
 	// nft has no OR between the match expressions of a rule, so every positive
 	// address type a policy names needs a rule of its own -- that is what makes
 	// src_addr/dest_addr a union of sources. Negated entries are the opposite:
@@ -315,7 +315,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		}
 		return { n4, n6, matched };
 	}
-
+	
 	// ── DNS Policy Routing ──────────────────────────────────────────────
 	
 	function dns_policy_routing(name, src_addr, dest_dns, uid, dest_dns_port, dest_dns_ipv4, dest_dns_ipv6, src_neg) {
@@ -338,7 +338,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		let first_value = bare_first_word(raw_src);
 		let src_is_v4 = src_addr ? !V.is_ipv6(first_value) : !!(src_neg && src_neg.n4);
 		let src_is_v6 = src_addr ? !V.is_ipv4(first_value) : !!(src_neg && src_neg.n6);
-
+	
 		if (!cfg.ipv6_enabled && V.is_ipv6(first_value)) {
 			process_dns_policy_error = true;
 			push(state.errors, { code: 'errorPolicyProcessNoIpv6', info: name });
@@ -377,7 +377,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				inline_set_ipv4_empty = !src_neg.n4;
 				inline_set_ipv6_empty = !src_neg.n6;
 			}
-
+	
 			// DNS rules already pin their family with 'meta nfproto', so the
 			// exclusions can just be appended to the rule they belong to.
 			if (src_neg) {
@@ -525,7 +525,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				dest_inline_set_ipv4_empty = !dest_neg.n4;
 				dest_inline_set_ipv6_empty = !dest_neg.n6;
 			}
-
+	
 			// An interface or MAC match (and an absent one) reads the same for
 			// both families, so only one rule is emitted for it. A family-
 			// specific exclusion breaks that: the IPv6 copy would carry no
@@ -636,6 +636,12 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 	
 	function dns_policy_process(uid, enabled, name, src_addr, dest_dns, dest_dns_port) {
 		if (enabled != '1') return 0;
+		// The name reaches nft raw -- as the comment on every rule the policy
+		// emits, on the sets it creates, and as the trailing comment on
+		// dnsmasq's nftset lines. Sanitise it here, where it enters, rather
+		// than at each of the dozen interpolations downstream; the errors and
+		// log lines below then quote exactly what ends up in the ruleset.
+		name = V.nft_comment(name);
 	
 		src_addr = replace(src_addr, /[,;{};]/g, ' ');
 		dest_dns = replace(dest_dns, /[,;{}]/g, ' ');
@@ -706,6 +712,12 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 	
 	function policy_process(uid, enabled, name, interface_name, src_addr, src_port, dest_addr, dest_port, proto, chain) {
 		if (enabled != '1') return 0;
+		// The name reaches nft raw -- as the comment on every rule the policy
+		// emits, on the sets it creates, and as the trailing comment on
+		// dnsmasq's nftset lines. Sanitise it here, where it enters, rather
+		// than at each of the dozen interpolations downstream; the errors and
+		// log lines below then quote exactly what ends up in the ruleset.
+		name = V.nft_comment(name);
 	
 		src_addr = replace(src_addr, /[,;{};]/g, ' ');
 		src_port = replace(src_port, /[,;{}]/g, ' ');
@@ -802,20 +814,20 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			push(dest_groups, { fg, fv });
 			processed_dest += (processed_dest ? ' ' : '') + fv;
 		}
-
+	
 		// The exclusions ride along on each of those rules instead of getting
 		// rules of their own.
 		let src_neg = collect_negations(neg_list_src, src_addr, 'src', interface_name, uid, name, true);
 		let dest_neg = collect_negations(neg_list_dest, dest_addr, 'dst', interface_name, uid, name, true);
 		if (src_neg.matched) processed_src += (processed_src ? ' ' : '') + src_neg.matched;
 		if (dest_neg.matched) processed_dest += (processed_dest ? ' ' : '') + dest_neg.matched;
-
+	
 		// No positive entries of a given side (none configured, or nothing but
 		// exclusions) still yields one rule for that side, carrying whatever
 		// exclusions it has.
 		if (!length(src_groups)) push(src_groups, { fg: 'none', fv: '' });
 		if (!length(dest_groups)) push(dest_groups, { fg: 'none', fv: '' });
-
+	
 		// ucode's for-in yields an array's values, not its indices, so each of
 		// these is the { fg, fv } pushed above.
 		for (let src_group in src_groups) {
@@ -1236,10 +1248,10 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 							return;
 						}
 						let tbl = pkg.ip_table_prefix + '_' + cfg.uplink_interface4;
-						system(pkg.ip_full + ' -4 rule del sport ' + listen_port + ' table ' + tbl + ' priority ' + prio + ' 2>/dev/null');
+						system(pkg.ip_full + ' -4 rule del sport ' + sh.quote(listen_port) + ' table ' + sh.quote(tbl) + ' priority ' + sh.quote(prio) + ' 2>/dev/null');
 						sh.ip('-4', 'rule', 'add', 'sport', listen_port, 'table', tbl, 'priority', prio);
 						if (cfg.ipv6_enabled) {
-							system(pkg.ip_full + ' -6 rule del sport ' + listen_port + ' table ' + tbl + ' priority ' + prio + ' 2>/dev/null');
+							system(pkg.ip_full + ' -6 rule del sport ' + sh.quote(listen_port) + ' table ' + sh.quote(tbl) + ' priority ' + sh.quote(prio) + ' 2>/dev/null');
 							sh.ip('-6', 'rule', 'add', 'sport', listen_port, 'table', tbl, 'priority', prio);
 						}
 						prio = '' + (+prio - 1);
@@ -1258,13 +1270,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			iface_priority = prio;
 			return 0;
 		}
-		system(pkg.ip_full + ' -4 rule del priority ' + prio + ' 2>/dev/null');
-		system(pkg.ip_full + ' -4 rule del lookup main suppress_prefixlength ' + cfg.prefixlength + ' 2>/dev/null');
+		system(pkg.ip_full + ' -4 rule del priority ' + sh.quote(prio) + ' 2>/dev/null');
+		system(pkg.ip_full + ' -4 rule del lookup main suppress_prefixlength ' + sh.quote(cfg.prefixlength) + ' 2>/dev/null');
 		sh.try_cmd(state.errors, pkg.ip_full, '-4', 'rule', 'add', 'lookup', 'main', 'suppress_prefixlength',
 			'' + cfg.prefixlength, 'pref', prio);
 		if (cfg.ipv6_enabled) {
-			system(pkg.ip_full + ' -6 rule del priority ' + prio + ' 2>/dev/null');
-			system(pkg.ip_full + ' -6 rule del lookup main suppress_prefixlength ' + cfg.prefixlength + ' 2>/dev/null');
+			system(pkg.ip_full + ' -6 rule del priority ' + sh.quote(prio) + ' 2>/dev/null');
+			system(pkg.ip_full + ' -6 rule del lookup main suppress_prefixlength ' + sh.quote(cfg.prefixlength) + ' 2>/dev/null');
 			sh.try_cmd(state.errors, pkg.ip_full, '-6', 'rule', 'add', 'lookup', 'main', 'suppress_prefixlength',
 				'' + cfg.prefixlength, 'pref', prio);
 		}

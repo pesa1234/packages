@@ -43,6 +43,12 @@ function create_sys(fs_mod, pkg) {
 		return false;
 	}
 
+	// Callers pass an argument VECTOR. Hand it to system() as an array so it is
+	// execvp()'d directly: no shell, so no quoting, no re-splitting on spaces,
+	// and no metacharacter interpretation of UCI-derived values. system() has
+	// accepted arrays since long before the oldest ucode pbr supports
+	// (verified on ucode 85922056 / OpenWrt 25.12) -- unlike fs.popen(), which
+	// is string-only there. Non-string elements are coerced by system() itself.
 	function ip(...args) {
 		if (length(args) < 1) return 1;
 		let fam = args[0];
@@ -62,20 +68,30 @@ function create_sys(fs_mod, pkg) {
 					push(newargs, rule_args[i]);
 				}
 				if (prio != null) {
-					system(pkg.ip_full + ' ' + fam + ' rule del priority ' + prio + ' 2>/dev/null');
-					return system(pkg.ip_full + ' ' + fam + ' rule add ' + join(' ', newargs) + ' pref ' + prio);
+					// Keeps the shell: system() has no fd redirection, and this
+					// delete is expected to fail when no such rule exists, so
+					// its stderr must be suppressed. quote() the interpolation.
+					system(pkg.ip_full + ' ' + fam + ' rule del priority ' + quote(prio) + ' 2>/dev/null');
+					return system([pkg.ip_full, fam, 'rule', 'add', ...newargs, 'pref', prio]);
 				}
-				return system(pkg.ip_full + ' ' + fam + ' rule add ' + join(' ', newargs));
+				return system([pkg.ip_full, fam, 'rule', 'add', ...newargs]);
 			}
-			return system(pkg.ip_full + ' ' + fam + ' ' + join(' ', rest));
+			return system([pkg.ip_full, fam, ...rest]);
 		}
-		return system(pkg.ip_full + ' ' + join(' ', args));
+		return system([pkg.ip_full, ...args]);
 	}
 
+	// Callers hand this an argument VECTOR too, but unlike ip() it cannot go to
+	// system() as an array: every caller is a command whose failure is expected
+	// and routine -- a route replace on an interface that has no gateway yet --
+	// so its stderr must be suppressed, and system() has no fd redirection (see
+	// run()). The shell therefore stays, and every element is quote()d instead,
+	// which is what keeps a value carrying a space or a shell metacharacter as
+	// one argv word. The recorded error carries the UNQUOTED join: that string
+	// is shown to the user, not executed.
 	function try_cmd(errors, ...args) {
-		let cmd = join(' ', args);
-		if (run(cmd) != 0) {
-			push(errors, { code: 'errorTryFailed', info: cmd });
+		if (run(join(' ', map(args, quote))) != 0) {
+			push(errors, { code: 'errorTryFailed', info: join(' ', args) });
 			return false;
 		}
 		return true;
