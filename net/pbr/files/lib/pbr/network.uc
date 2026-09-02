@@ -162,10 +162,22 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 		return V.str_contains(cfg.lan_device, d);
 	}
 	function is_ignored_interface(iface) { return V.str_contains_word(cfg.ignored_interface, iface); }
-	function is_tor_running() {
+	// Tor is usable as a policy target as soon as it is CONFIGURED: the
+	// redirect ports come out of torrc, not out of the running daemon. pbr is
+	// START=20 and OpenWrt's tor is START=50, so at boot the service is never
+	// up yet -- gating the port lookup on it left interface_process.tor()
+	// unrun, the ports empty, and every Tor rule interpolating 'redirect to :',
+	// which nft rejects for the whole file.
+	function is_tor_configured() {
 		if (is_ignored_interface('tor')) return false;
 		let content = readfile(pkg.tor_config_file);
-		if (!content || content == '') return false;
+		return !!(content && content != '');
+	}
+	// Whether the daemon is actually up. Fine for reporting, but do NOT gate
+	// rule generation on it: the ports live in torrc, the emitter keys off the
+	// policy's interface name alone, and pbr starts before tor at boot.
+	function is_tor_running() {
+		if (!is_tor_configured()) return false;
 		let svc = config.ubus_call('service', 'list', { name: 'tor' });
 		if (!svc?.tor?.instances) return false;
 		for (let k in keys(svc.tor.instances)) {
@@ -192,10 +204,24 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 		if (!proto) return false;
 		return !!env.protocols[lc(proto)];
 	}
+	// nft can only match a port on a protocol that HAS one. The policy dropdown
+	// is built from every line of /etc/protocols (46 of them on a stock 25.12),
+	// so the other 41 are selectable and cannot work: with a port they produce
+	// 'icmp dport ...', which nft refuses and which takes the whole ruleset with
+	// it; without one the protocol is dropped from the rule entirely.
+	// Verified against nftables 1.1.6 -- these five are accepted, the rest are not.
+	const proto_with_ports = { tcp: true, udp: true, sctp: true, dccp: true, udplite: true };
+	function proto_has_ports(proto) {
+		return !!proto_with_ports[lc(proto || '')];
+	}
 	function is_mwan4_strategy(iface) { return iface && index(iface, 'mwan4_strategy_') == 0; }
 	function is_supported_interface(iface) {
 		if (!iface) return false;
 		if (is_lan(iface) || is_disabled_interface(iface)) return false;
+		// Checked ahead of supported_interface: without a torrc there are no
+		// ports to redirect to, so a Tor policy cannot produce a usable rule
+		// however the interface was listed.
+		if (is_tor(iface)) return is_tor_configured();
 		if (V.str_contains_word(cfg.supported_interface, iface)) return true;
 		if (!is_ignored_interface(iface) && (is_uplink(iface) || is_wan(iface) || is_tunnel(iface))) return true;
 		if (is_ignore_target(iface)) return true;
@@ -232,6 +258,18 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 		return '';
 	}
 
+	// Record a warning unless an identical one is already there. Both gateway
+	// helpers below rewrite their interface argument to the uplink of their own
+	// address family, so on the usual wan + wan6 pair -- one device, one
+	// upstream -- processing 'wan' and then 'wan6' produces the same warning,
+	// with the same info string, twice. Two identical lines read as two faults;
+	// one interface with no gateway is one warning.
+	function push_warning_once(warnings, code, info) {
+		for (let w in warnings)
+			if (w.code == code && w.info == info) return;
+		push(warnings, { code: code, info: info });
+	}
+
 	function get_gateway4(iface, dev, warnings) {
 		if (is_uplink6(iface)) iface = cfg.uplink_interface4;
 		let gw = network_get_gateway(iface);
@@ -248,7 +286,7 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 			}
 			// Raise warning if no gw and not point-to-point
 			if (!gw && warnings && !is_p2p(dev))
-				push(warnings, { code: 'warningInterfaceRoutingUnknownGateway4', info: 'interface:' + iface + '; device:' + dev + ' ' });
+				push_warning_once(warnings, 'warningInterfaceRoutingUnknownGateway4', 'interface:' + iface + '; device:' + dev + ' ');
 		}
 		return gw;
 	}
@@ -275,7 +313,7 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 			}
 			// Raise warning if no gw and not point-to-point
 			if (!gw && warnings && !is_p2p(dev))
-				push(warnings, { code: 'warningInterfaceRoutingUnknownGateway6', info: 'interface:' + iface + '; device:' + dev + ' ' });
+				push_warning_once(warnings, 'warningInterfaceRoutingUnknownGateway6', 'interface:' + iface + '; device:' + dev + ' ');
 		}
 		return gw;
 	}
@@ -412,10 +450,10 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 		is_point_to_point, is_xfrm, is_p2p,
 		is_wan, is_uplink, is_uplink4, is_uplink6, is_split_uplink,
 		is_default_dev, is_disabled_interface, is_lan,
-		is_ignored_interface, is_tor_running,
+		is_ignored_interface, is_tor_running, is_tor_configured,
 		is_ignore_target, is_netifd_table, is_netifd_interface,
 		is_mwan4_interface, is_netifd_interface_default,
-		is_supported_protocol, is_mwan4_strategy,
+		is_supported_protocol, proto_has_ports, is_mwan4_strategy,
 		is_supported_interface, is_config_enabled,
 		get_gateway4, get_gateway6,
 		get_ipaddr4, get_ipaddr6,
