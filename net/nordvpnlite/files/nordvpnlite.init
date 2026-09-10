@@ -18,8 +18,10 @@ nordvpnlite_enabled() {
 }
 
 start_instance() {
+  local instance="${1:-automatic}"
+
   echo "Starting nordvpnlite service"
-  procd_open_instance
+  procd_open_instance "$instance"
   procd_set_param command "$PROG" start --no-detach
   procd_set_param stdout 1
   procd_set_param stderr 1
@@ -38,8 +40,12 @@ start_service() {
   start_instance
 }
 
+start_manual_instance() {
+  start_instance manual
+}
+
 manual_start() {
-  rc_procd start_instance
+  rc_procd start_manual_instance
 }
 
 manual_restart() {
@@ -56,6 +62,12 @@ stop_service() {
 
 reload_service() {
   if ! nordvpnlite_enabled; then
+    if service_running manual; then
+      echo "Reloading manually started nordvpnlite service"
+      "$PROG" reload
+      return
+    fi
+
     echo "Stopping nordvpnlite service disabled by /etc/config/nordvpnlite"
     "$PROG" stop
 
@@ -74,4 +86,8 @@ reload_service() {
   # Clean up an instance started outside procd before registering a new one.
   "$PROG" stop >/dev/null 2>&1
   rc_procd start_service
+}
+
+service_triggers() {
+  procd_add_reload_trigger nordvpnlite
 }
