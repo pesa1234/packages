@@ -6,7 +6,6 @@ STOP=01
 PROG=/usr/sbin/nordvpnlite
 
 extra_command "manual_start" "Start the service without changing option enabled"
-extra_command "manual_restart" "Restart the service without changing option enabled"
 
 nordvpnlite_enabled() {
   local enabled
@@ -46,13 +45,6 @@ start_manual_instance() {
 
 manual_start() {
   rc_procd start_manual_instance
-}
-
-manual_restart() {
-  trap '' TERM
-  stop
-  trap - TERM
-  manual_start
 }
 
 stop_service() {
