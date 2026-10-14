@@ -311,14 +311,10 @@ proto_openvpn_renew() {
 
 proto_openvpn_teardown() {
 	local iface="$1"
-	local pid
 
-	pid="$(cat "/var/run/openvpn.$iface.pid" 2>/dev/null)"
-	if [ -n "$pid" ]; then
-		daemon_pid="$pid" /usr/libexec/openvpn-hotplug cleanup "$iface"
-	else
-		/usr/libexec/openvpn-hotplug cleanup "$iface" 1
-	fi
+	# netifd finishes the teardown before it sets the interface up again, so
+	# no newer OpenVPN process can own the saved peer routes yet.
+	/usr/libexec/openvpn-hotplug cleanup "$iface" 1
 	proto_init_update "*" 0
 	proto_send_update "$iface"
 

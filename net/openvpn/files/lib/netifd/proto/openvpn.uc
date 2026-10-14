@@ -573,12 +573,10 @@ function proto_renew(proto) {
 
 function proto_teardown(proto) {
 	let iface = proto.iface;
-	let pid = pid_from_file(sprintf(OPENVPN_PID, iface));
 
-	if (pid)
-		system(sprintf('daemon_pid=%s /usr/libexec/openvpn-hotplug cleanup %s', shell_quote(pid), shell_quote(iface)));
-	else
-		system(sprintf('/usr/libexec/openvpn-hotplug cleanup %s 1', shell_quote(iface)));
+	// netifd finishes the teardown before it sets the interface up again,
+	// so no newer OpenVPN process can own the saved peer routes yet.
+	system(sprintf('/usr/libexec/openvpn-hotplug cleanup %s 1', shell_quote(iface)));
 	proto.update_link(false);
 
 	// best-effort cleanup
