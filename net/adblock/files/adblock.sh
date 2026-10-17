@@ -237,12 +237,15 @@ f_env() {
 	json_init
 	if [ -s "${adb_customfeedfile}" ]; then
 		if json_load_file "${adb_customfeedfile}" >/dev/null 2>&1; then
-			return
-		else
-			f_log "info" "can't load adblock custom feed file"
+			json_get_keys feedlist
+			if [ -n "${feedlist}" ]; then
+				f_log "info" "adblock custom feed file loaded successfully"
+				return
+			fi
 		fi
 	fi
 	if [ -s "${adb_feedfile}" ] && json_load_file "${adb_feedfile}" >/dev/null 2>&1; then
+		f_log "info" "adblock default feed file loaded successfully"
 		return
 	else
 		f_log "err" "can't load adblock feed file"
@@ -315,34 +318,27 @@ f_chkdom() {
 
 	"${adb_awkcmd}" -v type="${type}" -v pre="${prefix}" -v col="${column}" -v chk="${adb_lookupdomain}" -F "${separator}" '
 	{
+		# check optional search prefix
+		if (pre != "" && index($0, pre) != 1) next
 		domain = $col
 		# remove carriage returns and trim the input
 		gsub(/\r|^[[:space:]]+|[[:space:]]+$/, "", domain)
 		# add www. for google safe search
-		if (type=="google" && domain ~ /^\.+/) { sub(/^\.+/, "", domain); domain="www."domain }
-		# check optional search prefix
-		if (pre != "" && index($0, pre) != 1) next
+		if (type == "google" && domain ~ /^\.+/) { sub(/^\.+/, "", domain); domain = "www." domain }
 		# skip empty lines, comments and special domains
 		if (domain == "" || domain ~ /^(#|localhost|loopback)/ || index(domain, chk) == 1) next
-		# no domain with trailing dot
-		if (substr(domain, length(domain), 1) == ".") next
 		# check total length (253 characters)
-		if (length(domain) > 253) next
-		n = split(domain, L, ".")
-		valid = 1
-		for (i = 1; i <= n; i++) {
-			l = L[i]
-			len = length(l)
-			# label length 1–63
-			if (len < 1 || len > 63) { valid = 0; break }
-			# no leading/trailing hyphen
-			if (l ~ /^-/ || l ~ /-$/) { valid = 0; break }
-			# ASCII + hyphen
-			if (l !~ /^[A-Za-z0-9-]+$/) { valid = 0; break }
+		len = length(domain)
+		if (len > 253) next
+		domain = tolower(domain)
+		# ASCII + hyphen, no empty label, no leading/trailing hyphen, no trailing dot, TLD starts with a letter
+		if (domain !~ /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z]([a-z0-9-]*[a-z0-9])?$/) next
+		# label length 1–63, can only be exceeded by domains longer than 63 characters
+		if (len > 63) {
+			n = split(domain, L, ".")
+			for (i = 1; i <= n; i++) if (length(L[i]) > 63) next
 		}
-		# TLD must start with a letter or "xn--"
-		if (valid && L[n] !~ /^[A-Za-z]/ && L[n] !~ /^xn--/) valid = 0
-		if (valid) print tolower(domain)
+		print domain
 	}'
 
 	f_log "debug" "f_chkdom ::: name: ${src_name}, type: ${type}, prefix: ${prefix:-"-"}, column: ${column:-"-"}, separator: ${separator:-"-"}"
@@ -413,7 +409,22 @@ f_dns() {
 		adb_dnssafesearch="1"
 		adb_dnsstop="address=/#/\nlocal=/#/"
 		f_dnsdeny() {
-			"${adb_awkcmd}" '{print "local=/"$0"/"}' "${@}"
+			"${adb_awkcmd}" '
+				{
+					if (len > 0 && len + length($0) + 1 > 1000) {
+						print line
+						len = 0
+					}
+					if (len == 0) {
+						line = "local=/" $0 "/"
+						len = length(line)
+					} else {
+						line = line $0 "/"
+						len += length($0) + 1
+					}
+				}
+				END { if (len > 0) print line }
+			' "${@}"
 		}
 		f_dnsallow() {
 			"${adb_awkcmd}" '{print "local=/"$0"/#"}' "${@}"
@@ -708,8 +719,8 @@ f_count() {
 			for file in "${adb_tmpdir}/tmp.safesearch".*; do
 				[ -s "${file}" ] && files="${files} ${file}"
 			done
-			adb_cnt="$("${adb_awkcmd}" -v hdr="${adb_dnsheader}" '
-				NR == FNR { main++; next }
+			adb_cnt="$("${adb_awkcmd}" -v hdr="${adb_dnsheader}" -v dns="${adb_dns}" '
+				NR == FNR { main += (dns == "dnsmasq" ? split($0, seg, "/") - 2 : 1); next }
 				{ sub_cnt++ }
 				END {
 					cnt = main - sub_cnt
@@ -1308,6 +1319,7 @@ f_list() {
 				out_rc="${?}"
 			fi
 		fi
+		"${adb_rmcmd}" -f "${src_tmpload}"
 		;;
 	"backup")
 		file_name="${src_tmpfile}"
@@ -1409,52 +1421,35 @@ f_list() {
 # top level domain compression
 #
 f_tld() {
-	local cnt_tld cnt_rem source="${1}" temp_tld="${1}.tld"
+	local cnt_tld source="${1}" temp_tld="${1}.tld" allow="${adb_tmpdir}/tmp.rem.allowlist"
 
-	# reverse domain, get unique tlds and unreverse them back to original form
+	# single pass over the reversed, sorted input:
+	# drop subdomains of already kept domains, unreverse the rest and drop allowlisted (sub-) domains
+	# a stack of kept parents is needed, as siblings like 'com.foo-bar' sort between 'com.foo' and 'com.foo.sub'
 	#
-	if "${adb_awkcmd}" '
-		function unreverse(dom, n, seg, out, i) {
-			n = split(dom, seg, ".")
-			out = seg[n]
-			for (i = n-1; i >= 1; i--) out = out "." seg[i]
-			return out
-		}
+	if "${adb_awkcmd}" -v allow="${allow}" '
+		BEGIN { while ((getline line <allow) > 0) del[line] }
 		{
-			if (NR == 1) { parent = $NF }
-			else if (index($NF, parent ".") == 0) { print unreverse(parent); parent = $NF }
+			while (sp > 0 && index($0, stk[sp]) != 1) sp--
+			if (sp > 0 && index($0, stk[sp] ".") == 1) next
+			stk[++sp] = $0
+			n = split($0, seg, ".")
+			dom = seg[1]
+			if (dom in del) next
+			for (i = 2; i <= n; i++) {
+				dom = seg[i] "." dom
+				if (dom in del) next
+			}
+			print dom
 		}
-		END { if (parent) print unreverse(parent) }
 	' "${source}" >"${temp_tld}"; then
-		[ "${adb_debug}" = "1" ] && cnt_tld="$(f_count tld "${temp_tld}" "var")"
-
-		# remove allowlisted (sub-) domains from tld list if allowlist is enabled and not empty
-		#
-		if [ -s "${adb_tmpdir}/tmp.rem.allowlist" ]; then
-			"${adb_awkcmd}" '
-				NR==FNR {
-					del[$0]
-					next
-				}
-				{
-					dominated = 0
-					n = split($0, seg, ".")
-					for (i = 1; i <= n; i++) {
-						parent = seg[i]
-						for (j = i + 1; j <= n; j++) parent = parent "." seg[j]
-						if (parent in del) { dominated = 1; break }
-					}
-					if (!dominated) print
-				}
-			' "${adb_tmpdir}/tmp.rem.allowlist" "${temp_tld}" >"${source}"
-			"${adb_rmcmd}" -f "${temp_tld}"
-			[ "${adb_debug}" = "1" ] && cnt_rem="$(f_count tld "${source}" "var")"
-		else
-			"${adb_mvcmd}" -f "${temp_tld}" "${source}"
-		fi
+		"${adb_mvcmd}" -f "${temp_tld}" "${source}"
+		[ "${adb_debug}" = "1" ] && cnt_tld="$(f_count tld "${source}" "var")"
+	else
+		"${adb_rmcmd}" -f "${temp_tld}"
 	fi
 
-	f_log "debug" "f_tld    ::: name: -, cnt: ${adb_cnt:-"-"}, cnt_tld: ${cnt_tld:-"-"}, cnt_rem: ${cnt_rem:-"-"}"
+	f_log "debug" "f_tld    ::: name: -, cnt: ${adb_cnt:-"-"}, cnt_tld: ${cnt_tld:-"-"}"
 }
 
 # suspend/resume adblock processing
@@ -1575,11 +1570,6 @@ f_search() {
 	# search blocklist
 	#
 	case "${adb_dns}" in
-	"dnsmasq")
-		prefix='local=.*[\/\.]'
-		suffix='\/'
-		field="2"
-		;;
 	"unbound")
 		prefix='local-zone: .*["\.]'
 		suffix='" always_nxdomain'
@@ -1617,7 +1607,25 @@ f_search() {
 	#
 	while :; do
 		search="${domain//./\\.}"
-		res="$("${adb_awkcmd}" -F '/|\"|\t| ' "/^(${prefix}${search}${suffix})$/{i++;if(i<=3){printf \"  + %s\n\",\$${field}}else if(i==4){printf \"  + %s\n\",\"[...]\";exit}}" "${adb_finaldir}/${adb_dnsfile}")"
+		if [ "${adb_dns}" = "dnsmasq" ]; then
+			res="$("${adb_awkcmd}" -F '/' -v s="${domain}" '
+				$1 == "local=" && $NF == "" && index($0, s "/") {
+					for (f = 2; f < NF; f++) {
+						if ($f == s || (length($f) > length(s) && substr($f, length($f) - length(s)) == "." s)) {
+							i++
+							if (i <= 3) {
+								printf "  + %s\n", $f
+							} else {
+								printf "  + %s\n", "[...]"
+								exit
+							}
+						}
+					}
+				}
+			' "${adb_finaldir}/${adb_dnsfile}")"
+		else
+			res="$("${adb_awkcmd}" -F '/|\"|\t| ' "/^(${prefix}${search}${suffix})$/{i++;if(i<=3){printf \"  + %s\n\",\$${field}}else if(i==4){printf \"  + %s\n\",\"[...]\";exit}}" "${adb_finaldir}/${adb_dnsfile}")"
+		fi
 		printf '%s\n%s\n%s\n' ":::" "::: domain '${domain}' in active blocklist" ":::" >>"${result_tmp}"
 		printf '%s\n\n' "${res:-"  - no match"}" >>"${result_tmp}"
 		[ "${domain}" = "${tld}" ] && break
