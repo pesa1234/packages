@@ -109,16 +109,27 @@ smb_add_share()
 
 	[ -z "$name" ] || [ -z "$path" ] && return
 
+	# /etc/config/ksmbd is loaded first, so its shares win over runtime
+	# shares (/var/run/config/ksmbd) with the same name or path
+	if printf '%s\n' "$SHARES_SEEN" | grep -qxF -e "name:$name" -e "path:${path%/}"; then
+		logger -p daemon.info -t 'ksmbd' "Share '$name' ($path) is already defined, skipping it"
+		return
+	fi
+	SHARES_SEEN="$SHARES_SEEN
+name:$name
+path:${path%/}"
+
 	{
 		printf "\n[%s]\n\tpath = %s\n" "$name" "$path"
 		[ -n "$comment" ] && printf "\tcomment = %s\n" "$comment"
 
+		# valid users is checked against the logged in user,
+		# force user only sets the owner of the files
 		if [ "$force_root" -eq 1 ]; then
 			printf "\tforce user = %s\n" "root"
 			printf "\tforce group = %s\n" "root"
-		else
-			[ -n "$users" ] && printf "\tvalid users = %s\n" "$users"
 		fi
+		[ -n "$users" ] && printf "\tvalid users = %s\n" "$users"
 
 		[ -n "$create_mask" ] && printf "\tcreate mask = %s\n" "$create_mask"
 		[ -n "$dir_mask" ] && printf "\tdirectory mask = %s\n" "$dir_mask"
@@ -143,6 +154,7 @@ smb_add_share()
 init_config()
 {
 	mkdir -p /var/etc/ksmbd
+	SHARES_SEEN=
 
 	config_load ksmbd
 	CONFIG_APPEND=1 UCI_CONFIG_DIR=/var/run/config config_load ksmbd

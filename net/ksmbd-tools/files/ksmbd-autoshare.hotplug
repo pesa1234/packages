@@ -1,0 +1,220 @@
+#!/bin/sh
+# Mount USB and SD card storage under /mnt and share it with ksmbd.
+# Devices are probed with blkid and mounted here, without block-mount
+# or blockd (unlike ksmbd-hotplug, which shares what blockd mounts).
+#
+# Shares are written to /var/run/config/ksmbd, which the ksmbd init script
+# loads on top of /etc/config/ksmbd: they go away on unplug or reboot and
+# never point to an unmounted directory. A share already defined in
+# /etc/config/ksmbd for the same path or name is left alone.
+
+. /lib/functions.sh
+
+STATE_DIR=/var/run/ksmbd-autoshare
+RUN_CONFDIR=/var/run/config
+
+DEVNAME="${DEVNAME:-${DEVPATH##*/}}"
+SECTION="autoshare_$DEVNAME"
+STATE="$STATE_DIR/$DEVNAME.state"
+
+log() {
+	logger -t ksmbd-autoshare "$*"
+}
+
+run_uci() {
+	uci -q -c "$RUN_CONFDIR" -t "$STATE_DIR" "$@"
+}
+
+ksmbd_reload() {
+	/etc/init.d/ksmbd enabled || return 0
+	# During coldplug ubus is not up yet: ksmbd reads the shares when it starts
+	ubus list service >/dev/null 2>&1 || return 0
+	/etc/init.d/ksmbd reload
+}
+
+fs_registered() {
+	awk -v fs="$1" '$NF == fs { found = 1 } END { exit !found }' /proc/filesystems
+}
+
+device_allowed() {
+	case "$DEVNAME" in
+	sd*)
+		return 0
+		;;
+	mmcblk*)
+		# SD cards only, never the internal eMMC
+		[ "$(cat "/sys/block/${DEVNAME%%p*}/device/type" 2>/dev/null)" = "SD" ]
+		return
+		;;
+	esac
+	return 1
+}
+
+# Drop characters that are not allowed in SMB share names
+sanitize() {
+	echo "$1" | sed 's@[][[:cntrl:]"/\\:|<>+=;,*?%#]@@g; s/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# Used by another device mounted by this script
+taken() {
+	grep -qsxF "$1" "$STATE_DIR"/*.state
+}
+
+# Turn a mount_name/share_name setting into a free name, see
+# /etc/config/ksmbd-autoshare. $2 is prepended for the taken check.
+pick_name() {
+	local setting="$1" prefix="$2" name base n=2
+
+	case "$setting" in
+	label)
+		name="$LABEL"
+		;;
+	*%d*)
+		name=$(echo "$setting" | sed "s/%d/$DEVNAME/g")
+		;;
+	*)
+		base=$(sanitize "$setting")
+		name="$base"
+		while [ -n "$base" ] && taken "$prefix$name"; do
+			name="$base$n"
+			n=$((n + 1))
+		done
+		;;
+	esac
+
+	name=$(sanitize "$name")
+	case "$name" in
+	""|.|..)
+		name="$DEVNAME"
+		;;
+	esac
+	taken "$prefix$name" && name="${name}_$DEVNAME"
+	echo "$name"
+}
+
+mount_device() {
+	local dev="/dev/$DEVNAME" fstype opts mount_name share_name
+
+	fstype=$(blkid -c /dev/null -o value -s TYPE "$dev")
+	case "$fstype" in
+	vfat)
+		opts="rw,sync,noatime,utf8,fmask=0000,dmask=0000"
+		;;
+	exfat)
+		opts="rw,sync,noatime,iocharset=utf8,fmask=0000,dmask=0000"
+		;;
+	ntfs)
+		# Prefer the ntfs driver (kmod-fs-ntfs), fall back to ntfs3
+		if fs_registered ntfs3 && ! fs_registered ntfs; then
+			fstype=ntfs3
+			opts="rw,prealloc,discard,force,fmask=0000,dmask=0000"
+		else
+			opts="rw,iocharset=utf8,discard,fmask=0000,dmask=0000"
+		fi
+		;;
+	ext2|ext3|ext4)
+		fstype=ext4
+		opts="rw,sync,noatime"
+		;;
+	f2fs)
+		opts="rw,atgc,gc_merge,lazytime"
+		;;
+	*)
+		return 1
+		;;
+	esac
+
+	# Leave alone anything mounted elsewhere (fstab, extroot, ...)
+	grep -q "^$dev " /proc/mounts && return 1
+	rm -f "$STATE"
+
+	config_load ksmbd-autoshare
+	config_get mount_name global mount_name label
+	config_get share_name global share_name label
+
+	LABEL=$(blkid -c /dev/null -o value -s LABEL "$dev")
+	MNT="/mnt/$(pick_name "$mount_name" /mnt/)"
+	NAME=$(pick_name "$share_name")
+
+	mkdir -p "$MNT"
+	if ! mount -t "$fstype" -o "$opts" "$dev" "$MNT"; then
+		log "Failed to mount $dev ($fstype) on $MNT"
+		rmdir "$MNT" 2>/dev/null
+		return 1
+	fi
+
+	mkdir -p "$STATE_DIR"
+	printf '%s\n%s\n' "$MNT" "$NAME" > "$STATE"
+	log "Mounted $dev ($fstype) on $MNT"
+}
+
+check_share() {
+	local path name guest_ok
+
+	config_get path "$1" path
+	config_get name "$1" name
+	[ "${path%/}" = "$MNT" ] || [ "$name" = "$NAME" ] || return 0
+
+	EXISTING="$name"
+	config_get_bool guest_ok "$1" guest_ok 0
+	[ "$guest_ok" -eq 1 ] && log "Share '$name' in /etc/config/ksmbd allows guest access"
+}
+
+share_device() {
+	EXISTING=
+	config_load ksmbd
+	config_foreach check_share share
+	if [ -n "$EXISTING" ]; then
+		log "Share '$EXISTING' already in /etc/config/ksmbd, not sharing $MNT"
+		return 0
+	fi
+
+	[ -f "$RUN_CONFDIR/ksmbd" ] || {
+		mkdir -p "$RUN_CONFDIR"
+		touch "$RUN_CONFDIR/ksmbd"
+	}
+	run_uci set "ksmbd.$SECTION=share"
+	run_uci set "ksmbd.$SECTION.name=$NAME"
+	run_uci set "ksmbd.$SECTION.path=$MNT"
+	run_uci set "ksmbd.$SECTION.browseable=yes"
+	run_uci set "ksmbd.$SECTION.read_only=no"
+	# Only authenticated ksmbd users, files are written as root
+	run_uci set "ksmbd.$SECTION.guest_ok=no"
+	run_uci set "ksmbd.$SECTION.force_root=1"
+	run_uci set "ksmbd.$SECTION.create_mask=0666"
+	run_uci set "ksmbd.$SECTION.dir_mask=0777"
+	run_uci commit ksmbd
+	log "Shared $MNT as '$NAME'"
+	ksmbd_reload
+}
+
+remove_device() {
+	local mnt
+
+	[ -f "$STATE" ] || return 0
+	read -r mnt < "$STATE"
+	rm -f "$STATE"
+
+	if [ -n "$(run_uci get "ksmbd.$SECTION")" ]; then
+		run_uci delete "ksmbd.$SECTION"
+		run_uci commit ksmbd
+		log "Removed share for $mnt"
+		ksmbd_reload
+	fi
+
+	# The device is already gone: detach lazily if files are still open
+	umount "$mnt" 2>/dev/null || umount -l "$mnt"
+	rmdir "$mnt" 2>/dev/null
+	log "Unmounted $mnt"
+}
+
+case "$ACTION" in
+add)
+	device_allowed || exit 0
+	mount_device || exit 0
+	share_device
+	;;
+remove)
+	remove_device
+	;;
+esac
