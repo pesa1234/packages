@@ -7,6 +7,7 @@ ksmbd-server)
 	/usr/sbin/ksmbd.mountd -V 2>&1 | grep -F "$PKG_VERSION"
 	;;
 
+ksmbd-autoshare|\
 ksmbd-avahi-service|\
 ksmbd-hotplug)
 	exit 0

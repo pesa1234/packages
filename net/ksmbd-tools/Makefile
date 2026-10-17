@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ksmbd-tools
 PKG_VERSION:=3.5.7
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/cifsd-team/ksmbd-tools/releases/download/$(PKG_VERSION)
@@ -67,6 +67,28 @@ define Package/ksmbd-hotplug
   DEPENDS:=+blockd
 endef
 
+define Package/ksmbd-autoshare
+  $(call Package/ksmbd-tools/Default)
+  TITLE+= hotplug script for automount and sharing
+  DEPENDS:=+ksmbd-server +blkid +USB_SUPPORT:kmod-usb-storage \
+	+kmod-fs-vfat +kmod-fs-exfat +kmod-fs-ntfs +kmod-nls-utf8 \
+	+kmod-fs-ext4 +kmod-fs-f2fs
+  CONFLICTS:=ksmbd-hotplug
+endef
+
+define Package/ksmbd-autoshare/description
+  installs: /etc/hotplug.d/block/20-ksmbd-autoshare
+
+  Mounts USB and SD card partitions under /mnt and shares them with
+  ksmbd. Unlike ksmbd-hotplug it does not need block-mount or blockd:
+  devices are probed with blkid and mounted by the script itself.
+  Mount and share names are set in /etc/config/ksmbd-autoshare.
+  It pulls in the kernel modules for USB storage and for the filesystems
+  of Windows (FAT, exFAT, NTFS) and Linux (ext2/3/4, F2FS) drives.
+  Shares need a ksmbd user (no guest access), live in
+  /var/run/config/ksmbd and are removed when the device is unplugged.
+endef
+
 MESON_ARGS += \
 	-Db_lto=true \
 	-Dkrb5=disabled
@@ -99,6 +121,12 @@ define Package/ksmbd-hotplug/install
 	$(INSTALL_CONF) ./files/ksmbd.hotplug $(1)/etc/hotplug.d/mount/60-ksmbd
 endef
 
+define Package/ksmbd-autoshare/install
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/hotplug.d/block
+	$(INSTALL_CONF) ./files/ksmbd-autoshare.config $(1)/etc/config/ksmbd-autoshare
+	$(INSTALL_DATA) ./files/ksmbd-autoshare.hotplug $(1)/etc/hotplug.d/block/20-ksmbd-autoshare
+endef
+
 define Package/ksmbd-server/conffiles
 /etc/config/ksmbd
 /etc/ksmbd/ksmbd.conf.template
@@ -110,6 +138,11 @@ define Package/ksmbd-avahi-service/conffiles
 /etc/avahi/services/smb.service
 endef
 
+define Package/ksmbd-autoshare/conffiles
+/etc/config/ksmbd-autoshare
+endef
+
 $(eval $(call BuildPackage,ksmbd-server))
 $(eval $(call BuildPackage,ksmbd-avahi-service))
 $(eval $(call BuildPackage,ksmbd-hotplug))
+$(eval $(call BuildPackage,ksmbd-autoshare))
