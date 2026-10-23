@@ -67,6 +67,29 @@ parse_cidr6() {
 	echo "$addr $plen"
 }
 
+# Source-routed uplinks such as wan6 only install "default from <prefix>"
+# routes, which a lookup without a source address cannot match. Retry from the
+# global addresses outside the tunnel, as the kernel does when it picks the
+# source address for the OpenVPN socket.
+ipv6_route_get_from_source() {
+	local target="$1"
+	local line addr_dev=
+
+	ip -6 addr show scope global 2>/dev/null | while read -r line; do
+		set -- $line
+		case "$1" in
+			[0-9]*:)
+				addr_dev="${2%:}"
+				addr_dev="${addr_dev%@*}"
+			;;
+			inet6)
+				[ "$addr_dev" != "$dev" ] || continue
+				ip -6 route get "$target" from "${2%/*}" 2>/dev/null && break
+			;;
+		esac
+	done
+}
+
 route_path_for_target() {
 	local family="$1"
 	local target="$2"
@@ -77,7 +100,11 @@ route_path_for_target() {
 
 	[ -n "$target" ] || return 1
 
-	output="$(ip "-$family" route get "$target" 2>/dev/null)" || return 1
+	if ! output="$(ip "-$family" route get "$target" 2>/dev/null)"; then
+		[ "$family" = 6 ] || return 1
+		output="$(ipv6_route_get_from_source "$target")"
+		[ -n "$output" ] || return 1
+	fi
 
 	set -- $output
 	while [ "$#" -gt 0 ]; do
