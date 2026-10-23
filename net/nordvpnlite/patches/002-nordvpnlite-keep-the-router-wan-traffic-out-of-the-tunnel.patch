@@ -1,0 +1,138 @@
+From 9867708d9be87bfe1100e57ad5807f0e443de481 Mon Sep 17 00:00:00 2001
+From: Andrea Pesaresi <andreapesaresi82@gmail.com>
+Date: Fri, 23 Oct 2026 21:22:02 +0200
+Subject: [PATCH] nordvpnlite: Keep the router's WAN traffic out of the tunnel
+
+On OpenWRT the exit routes send everything the router itself sends into
+the tunnel, not only what it forwards from the LAN. That includes the
+resets and ICMP errors it sends back when something on the internet
+knocks on the WAN, which on a typical home router happens every few
+seconds. Those replies belong to connections that came in on the WAN, so
+they are not masqueraded and enter the tunnel with the WAN address as
+source.
+
+The VPN server does not drop them. About one round trip later it starts
+sending packets of other, unrelated connections to that WAN address
+instead of the tunnel address. The router has no socket for them and
+answers with a reset, the server closes the connection, and the LAN
+client keeps waiting on a connection that is already gone. Long lived
+connections like game sessions and streamed API responses drop all the
+time while the VPN is up. A capture on an MT6000 showed 43 of these
+bursts in six minutes, each one 46-160 ms after the router had sent a
+packet with its WAN address into the tunnel.
+
+Add a small nftables table that drops packets leaving the tunnel with a
+source other than the tunnel address. It hooks postrouting after source
+NAT, so forwarded traffic, which is already masqueraded to the tunnel
+address, is not affected. It lives outside the fw4 table, so firewall
+reloads keep it and nothing is written to flash, and it is removed
+together with the exit routes. A failure to add it is only logged, so
+the VPN still connects on releases without nft.
+---
+ clis/nordvpnlite/src/interface.rs | 65 +++++++++++++++++++++++++++++++
+ 1 file changed, 65 insertions(+)
+
+diff --git a/clis/nordvpnlite/src/interface.rs b/clis/nordvpnlite/src/interface.rs
+index 846a8a6c..5918397a 100644
+--- a/clis/nordvpnlite/src/interface.rs
++++ b/clis/nordvpnlite/src/interface.rs
+@@ -6,6 +6,7 @@ use std::net::IpAddr;
+ use std::process::Command;
+ use tracing::{debug, error, info};
+ 
++use telio_core::telio_model::constants::LOCAL_TUNNEL_IPV4;
+ #[cfg(target_os = "linux")]
+ use telio_core::telio_utils::LIBTELIO_FWMARK;
+ 
+@@ -26,6 +27,9 @@ const MIN_TUNNEL_MTU: u32 = 1280;
+ /// configuration untouched.
+ const UCI_STATE_DIR: &str = "/var/state";
+ 
++/// nftables table holding the tunnel source guard on OpenWRT.
++const SOURCE_GUARD_TABLE: &str = "nordvpnlite";
++
+ pub trait ConfigureInterface {
+     /// Initialize the interface
+     fn initialize(&mut self) -> Result<(), NordVpnLiteError>;
+@@ -659,6 +663,59 @@ impl Uci {
+         Ok(())
+     }
+ 
++    /// Helper to drop packets leaving the tunnel with a source other than the
++    /// tunnel address.
++    ///
++    /// The exit routes also send the router's own packets into the tunnel,
++    /// including the resets and ICMP errors it answers to unsolicited packets
++    /// arriving on the WAN. Those keep the WAN address as source, because they
++    /// belong to connections that came in on the WAN and are not masqueraded.
++    /// The VPN server accepts them and then delivers packets of other
++    /// connections to that address, where the router resets them.
++    ///
++    /// The table is separate from the fw4 one, so firewall reloads keep it and
++    /// nothing is saved to flash.
++    fn add_source_guard(&self) -> Result<(), NordVpnLiteError> {
++        // Start from scratch in case a previous run did not clean up
++        self.remove_source_guard();
++
++        execute(Command::new("nft").args(["add", "table", "inet", SOURCE_GUARD_TABLE]))?;
++        // Run after source NAT, so forwarded traffic already carries the
++        // tunnel address
++        execute(Command::new("nft").args([
++            "add",
++            "chain",
++            "inet",
++            SOURCE_GUARD_TABLE,
++            "postrouting",
++            "{ type filter hook postrouting priority srcnat + 10; policy accept; }",
++        ]))?;
++        execute(Command::new("nft").args([
++            "add",
++            "rule",
++            "inet",
++            SOURCE_GUARD_TABLE,
++            "postrouting",
++            "oifname",
++            &format!("\"{}\"", self.interface_name),
++            "ip",
++            "saddr",
++            "!=",
++            &LOCAL_TUNNEL_IPV4.to_string(),
++            "drop",
++        ]))?;
++        Ok(())
++    }
++
++    // Helper to remove the tunnel source guard
++    fn remove_source_guard(&self) {
++        if let Err(e) =
++            execute(Command::new("nft").args(["delete", "table", "inet", SOURCE_GUARD_TABLE]))
++        {
++            debug!("nft couldn't delete table {SOURCE_GUARD_TABLE}: {e}");
++        }
++    }
++
+     fn remove_exit_routes(&mut self) {
+         debug!("Removing exit routes");
+         if let Err(e) = execute(Command::new("uci").args(["del", "network.nordvpnlite_route"])) {
+@@ -680,6 +737,8 @@ impl Uci {
+             error!("Error removing forwarding: {e}");
+         }
+ 
++        self.remove_source_guard();
++
+         // Restore DNS settings and DHCP options
+         if let Err(e) = self.restore_dnsmasq() {
+             error!("Error restoring dnsmasq: {e}");
+@@ -825,6 +884,12 @@ impl ConfigureInterface for Uci {
+         execute(Command::new("uci").args(["set", "firewall.nordvpnlite_vpn_forwarding.src=lan"]))?;
+         execute(Command::new("uci").args(["set", "firewall.nordvpnlite_vpn_forwarding.dest=vpn"]))?;
+ 
++        // Keep the router's own WAN traffic out of the tunnel. Not fatal, so
++        // the VPN still connects where nft is missing (fw3 based releases).
++        if let Err(e) = self.add_source_guard() {
++            error!("Error adding tunnel source guard: {e}");
++        }
++
+         // Disable IPv6
+         self.disable_ipv6()?;
+ 
