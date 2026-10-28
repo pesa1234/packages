@@ -1,5 +1,5 @@
 'use strict';
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2020-2026 MOSSDeF, Stan Grishin (stangri@melmac.ca).
 //
 // Entry point: module wiring, service lifecycle, policy processing,
@@ -325,12 +325,6 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		let nft_table = pkg.nft_table;
 		let nft_prefix = pkg.nft_prefix;
 	
-		if (!dest_dns_ipv4 && !dest_dns_ipv6) {
-			process_dns_policy_error = true;
-			push(state.errors, { code: 'errorPolicyProcessNoInterfaceDns', info: "'" + dest_dns + "'" });
-			return 1;
-		}
-	
 		// A rule built from exclusions alone has no positive source to take its
 		// family from, so fall back to the negated entries for the guards below
 		// and let the exclusions themselves decide which families to emit.
@@ -585,15 +579,16 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				}
 				chain = 'dstnat';
 				let p4_base = nft_insert + ' rule inet ' + nft_table + ' ' + nft_prefix + '_' + chain +
-					rule_params + ' meta nfproto ipv4 ' + param4;
+					' meta nfproto ipv4 ' + param4;
 				let p6_base = nft_insert + ' rule inet ' + nft_table + ' ' + nft_prefix + '_' + chain +
-					rule_params + ' meta nfproto ipv6 ' + param6;
+					' meta nfproto ipv6 ' + param6;
+				// Counters run in order; count only after every match, including dport.
 				let tor_rules = [
-					'udp dport 53 redirect to :' + env.tor_dns_port + ' comment "Tor-DNS-UDP"',
-					'tcp dport 80 redirect to :' + env.tor_traffic_port + ' comment "Tor-HTTP-TCP"',
-					'udp dport 80 redirect to :' + env.tor_traffic_port + ' comment "Tor-HTTP-UDP"',
-					'tcp dport 443 redirect to :' + env.tor_traffic_port + ' comment "Tor-HTTPS-TCP"',
-					'udp dport 443 redirect to :' + env.tor_traffic_port + ' comment "Tor-HTTPS-UDP"',
+					'udp dport 53' + rule_params + ' redirect to :' + env.tor_dns_port + ' comment "Tor-DNS-UDP"',
+					'tcp dport 80' + rule_params + ' redirect to :' + env.tor_traffic_port + ' comment "Tor-HTTP-TCP"',
+					'udp dport 80' + rule_params + ' redirect to :' + env.tor_traffic_port + ' comment "Tor-HTTP-UDP"',
+					'tcp dport 443' + rule_params + ' redirect to :' + env.tor_traffic_port + ' comment "Tor-HTTPS-TCP"',
+					'udp dport 443' + rule_params + ' redirect to :' + env.tor_traffic_port + ' comment "Tor-HTTPS-UDP"',
 				];
 				for (let dest_rule in tor_rules) {
 					if (!src_inline_set_ipv4_empty && !dest_inline_set_ipv4_empty) {
@@ -677,6 +672,11 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		// is_family_mismatch (which expected one address per call).
 		if (net.is_supported_interface(dest_dns_interface)) {
 			let dns_list = config.uci_ctx('network').get('network', dest_dns_interface, 'dns');
+			// 'option dns' is as common in the wild as 'list dns', and uci hands
+			// it back as one whitespace-separated string. Unsplit it matched
+			// neither is_ipv4 nor is_ipv6 and the servers were dropped.
+			if (type(dns_list) == 'string')
+				dns_list = filter(split(trim(dns_list), /\s+/), d => d != '');
 			if (type(dns_list) == 'array') {
 				for (let d in dns_list) {
 					if (V.is_ipv4(d) && !dest_dns_ipv4) dest_dns_ipv4 = d;
@@ -694,6 +694,20 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		}
 		if (!dest_dns) {
 			push(state.errors, { code: 'errorPolicyNoDns', info: name });
+			output.fail(); return 1;
+		}
+		// dest_dns named something, but it resolved to no server for either
+		// family -- typically an interface whose DNS could not be determined.
+		// This has to be caught HERE. The loop below skips the ipv4 and ipv6
+		// groups for the family they lack, so a policy with a plain-address
+		// source matches only those two, emits nothing, and falls through to
+		// output.ok() -- routing nothing while reporting success.
+		// dns_policy_routing() raises the same error, but only the three
+		// family-agnostic groups (phys_dev, mac_address, domain) ever reach it,
+		// so the fault was reported for a MAC source and silent for an address.
+		if (!dest_dns_ipv4 && !dest_dns_ipv6) {
+			// bare value: the message template quotes its argument already
+			push(state.errors, { code: 'errorPolicyProcessNoInterfaceDns', info: dest_dns });
 			output.fail(); return 1;
 		}
 	
@@ -746,6 +760,21 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		}
 		if (!interface_name) {
 			push(state.errors, { code: 'errorPolicyNoInterface', info: name });
+			output.fail(); return 1;
+		}
+		// A chain pbr does not create cannot hold a rule: nft answers "No such
+		// file or directory" and rejects the whole file, so the service stops.
+		// The README listed 'input' and 'postrouting' for years and neither has
+		// existed since before 1.2.2 -- but a plain typo does the same thing.
+		// 'dstnat' is not in chains_list yet IS created (nft.uc), and a policy
+		// naming it works today, so accept it rather than break such a config.
+		// Tor is exempt: its rules always go to dstnat and 'chain' is ignored, so
+		// a bogus chain on a Tor policy has always been harmless -- it draws
+		// warningTorUnsetChainNft below instead of taking the policy down.
+		if (chain && !net.is_tor(interface_name) &&
+			!V.str_contains_word(pkg.chains_list + ' dstnat', lc(chain))) {
+			push(state.errors, { code: 'errorPolicyUnknownChain',
+				info: "'" + name + "' (" + chain + ")" });
 			output.fail(); return 1;
 		}
 		// 'proto' is a PORT QUALIFIER, not a match of its own: it only ever
@@ -2477,7 +2506,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		printf('===== %s chains - policies =====\n', pkg.name);
 		for (let ch in split(pkg.chains_list + ' dstnat', /\s+/)) {
 			_exec_print('nft -a list table inet ' + pkg.nft_table +
-				" | sed -n '/chain " + pkg.nft_prefix + '_' + ch + " {/,/\\t}/p'");
+				' | sed -n ' + sh.quote('/chain ' + pkg.nft_prefix + '_' + ch + ' {/,/\\t}/p'));
 		}
 
 		printf('===== %s chains - marking =====\n', pkg.name);
@@ -2485,7 +2514,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		for (let mc in split(mark_chains, /\s+/)) {
 			if (!mc) continue;
 			_exec_print('nft -a list table inet ' + pkg.nft_table +
-				" | sed -n '/chain " + mc + " {/,/\\t}/p'");
+				' | sed -n ' + sh.quote('/chain ' + mc + ' {/,/\\t}/p'));
 		}
 
 		printf('===== %s nft sets =====\n', pkg.name);
@@ -2493,7 +2522,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		for (let ns in split(sets, /\s+/)) {
 			if (!ns) continue;
 			_exec_print('nft -a list table inet ' + pkg.nft_table +
-				" | sed -n '/set " + ns + " {/,/\\t}/p'");
+				' | sed -n ' + sh.quote('/set ' + ns + ' {/,/\\t}/p'));
 		}
 
 		if (stat(pkg.dnsmasq_file)?.size > 0) {

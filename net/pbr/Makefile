@@ -4,8 +4,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pbr
-PKG_VERSION:=1.2.3
-PKG_RELEASE:=99
+PKG_VERSION:=1.2.4
+PKG_RELEASE:=2
 PKG_LICENSE:=AGPL-3.0-or-later
 PKG_MAINTAINER:=Stan Grishin <stangri@melmac.ca>, Erik Conijn <egc112@msn.com>
 
@@ -21,13 +21,11 @@ define Package/pbr
   DEPENDS:= \
 	+ip-full \
 	+jshn \
-	+jsonfilter \
 	+resolveip \
 	+ucode \
 	+ucode-mod-fs \
 	+ucode-mod-uci \
 	+ucode-mod-ubus \
-	+!BUSYBOX_DEFAULT_AWK:gawk \
 	+!BUSYBOX_DEFAULT_GREP:grep \
 	+!BUSYBOX_DEFAULT_SED:sed \
 	+kmod-nft-core \
