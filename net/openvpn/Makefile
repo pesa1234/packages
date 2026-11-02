@@ -47,10 +47,11 @@ define Package/openvpn/Default
   VARIANT:=$(1)
   DEFAULT_VARIANT:=$(4)
   PROVIDES:=openvpn openvpn-crypto
+  CONFLICTS:=$(5)
 endef
 
-Package/openvpn-openssl=$(call Package/openvpn/Default,openssl,OpenSSL,+PACKAGE_openvpn-openssl:libopenssl)
-Package/openvpn-mbedtls=$(call Package/openvpn/Default,mbedtls,mbedTLS,+PACKAGE_openvpn-mbedtls:libmbedtls,1)
+Package/openvpn-openssl=$(call Package/openvpn/Default,openssl,OpenSSL,+PACKAGE_openvpn-openssl:libopenssl,,openvpn-wolfssl)
+Package/openvpn-mbedtls=$(call Package/openvpn/Default,mbedtls,mbedTLS,+PACKAGE_openvpn-mbedtls:libmbedtls,1,openvpn-openssl openvpn-wolfssl)
 Package/openvpn-wolfssl=$(call Package/openvpn/Default,wolfssl,WolfSSL,+PACKAGE_openvpn-wolfssl:libwolfssl)
 
 define Package/openvpn/config/Default
