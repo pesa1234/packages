@@ -49,7 +49,8 @@
 # It also flushes dnsmasq's cache, which a run outside pbr has to do itself:
 # dnsmasq only writes to an nft set when it takes an answer from upstream, so
 # lookups served from its cache would add nothing at all. A standalone run
-# takes a second or two.
+# takes about five seconds, four of them waiting for dnsmasq to act on that
+# flush.
 #
 # The variable says how the script is being RUN, not what it does to the sets;
 # rebuilding them is the separate dnsprefetch_flush_sets option below.
@@ -111,9 +112,11 @@
 # pass records the pbr ucode worker's pid, re-executes this file in its own
 # session and returns immediately. The detached copy waits for that worker to
 # exit: only then have fw4 reload, set cleanup and pbr's resolver restart/cache
-# flush request all completed. dnsmasq may still be applying that request, so
-# its readiness is probed below. Watching the nft file is too early because pbr
-# copies it before running fw4; a fixed delay raced dnsmasq on large setups.
+# flush request all completed. dnsmasq may still be applying that request, and
+# the instance pbr told to stop can go on answering for a few seconds: so the
+# first pass also records the dnsmasq pids, and the copy waits for those to go
+# away before it probes readiness. Watching the nft file is too early because
+# pbr copies it before running fw4; a fixed delay raced dnsmasq on large setups.
 #
 # The service sources this file, so it cannot discover its own path ($0 is the
 # sourcing shell). Update this if you install it somewhere else.
@@ -160,8 +163,11 @@ if [ -z "$PBR_DNSPREFETCH_CHILD" ]; then
 		_dnsprefetch_parent="$PPID"
 		tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null |
 			grep -q '/lib/pbr/cli\.uc' || _dnsprefetch_parent=''
+		# The dnsmasq pids are taken here, not in the copy: this pass runs
+		# before pbr restarts dnsmasq, the copy possibly after.
 		PBR_DNSPREFETCH_CHILD=1 \
 		PBR_DNSPREFETCH_PARENT_PID="$_dnsprefetch_parent" \
+		PBR_DNSPREFETCH_DNSMASQ_PIDS="$(pidof dnsmasq)" \
 		setsid /bin/sh "$_dnsprefetch_self" </dev/null >/dev/null 2>&1 &
 	else
 		# The only failure this script cannot report from the detached copy,
@@ -252,6 +258,37 @@ else
 				return 1
 			}
 			sleep '1' && timeout_nft="$((timeout_nft - 1))"
+		done
+	}
+
+	# pbr's '/etc/init.d/dnsmasq restart' returns once procd has been told, not
+	# once the old dnsmasq is gone, and that one can be slow to notice. For a
+	# DHCPDISCOVER on a dynamic address dnsmasq pings the address first, and
+	# for those PING_WAIT (3) seconds it goes on answering DNS but is deaf to
+	# signals (delay_dhcp() in its dnsmasq.c). dnsmasq_ready is then satisfied
+	# by the instance that is about to exit: one observed boot resolved all 91
+	# names in that window, against a dnsmasq started before pbr had written
+	# its nftset lines, which adds nothing to any set.
+	#
+	# So wait for every dnsmasq the first pass recorded to exit. When pbr did
+	# not restart it -- unchanged nftset file, cache-flushing HUP instead --
+	# those pids never go away and the budget runs out; it is sized to outlast
+	# PING_WAIT, so by then a deaf dnsmasq has handled the HUP as well. A pid
+	# counts only while it is still a dnsmasq, in case it was reused. A
+	# standalone run records no pids and returns at once.
+	dnsmasq_old_gone() {
+		local timeout_old_dnsmasq='4'
+		local pid pids="$1" running
+
+		[ -n "$pids" ] || return 0
+		while :; do
+			running='0'
+			for pid in $pids; do
+				[ "$(cat "/proc/$pid/comm" 2>/dev/null)" = 'dnsmasq' ] && running='1'
+			done
+			[ "$running" -eq '0' ] && return 0
+			[ "$timeout_old_dnsmasq" -eq '0' ] && return 0
+			sleep '1' && timeout_old_dnsmasq="$((timeout_old_dnsmasq - 1))"
 		done
 	}
 
@@ -422,6 +459,8 @@ else
 			rc='1'
 		}
 
+		[ "$rc" -eq '0' ] && dnsmasq_old_gone "$PBR_DNSPREFETCH_DNSMASQ_PIDS"
+
 		[ "$rc" -eq '0' ] && ! dnsmasq_ready && {
 			output "Dnsmasq is not answering, $msg_abort $__FAIL__"
 			rc='1'
@@ -435,11 +474,12 @@ else
 		# process_reply()), never when it answers from its own cache. Without the
 		# flush the lookups below return cached answers and add nothing at all --
 		# which with set flushing enabled would leave the sets empty. Wait
-		# one second before probing to ensure the first answer cannot race ahead of
-		# dnsmasq handling the signal.
+		# before probing so that the first answer cannot race ahead of dnsmasq
+		# handling the signal: it can be deaf to it for PING_WAIT (3) seconds
+		# and answer from its cache meanwhile, see dnsmasq_old_gone.
 		[ "$rc" -eq '0' ] && [ "$flush_dns_cache" -eq '1' ] && {
 			killall -q -s HUP dnsmasq
-			sleep '1'
+			sleep '4'
 			! dnsmasq_ready && {
 				output "Dnsmasq is not answering after cache flush, $msg_abort $__FAIL__"
 				rc='1'
