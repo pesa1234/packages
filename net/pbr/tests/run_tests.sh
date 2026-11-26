@@ -2,99 +2,9 @@
 
 line='........................................'
 
-# Create a patched copy of pbr.uc that converts ES module imports to require()
-# calls, so the mock framework can intercept them through the module cache.
-# The original uses:
-#   import { readfile, writefile, popen, stat, unlink, open, glob, mkdir, mkstemp, access, dirname, lsdir } from 'fs';
-#   import { cursor } from 'uci';
-#   import { connect } from 'ubus';
-# We convert to require() calls so mocklib can intercept them.
-patch_dir="/tmp/pbr_test_modules.$$"
-mkdir -p "$patch_dir"
-
-# Symlink sub-modules so that import statements in the patched pbr.uc
-# resolve correctly (import resolves relative to the importing file).
-for mod in pkg.uc validators.uc sys.uc output.uc config.uc \
-           platform.uc network.uc nft.uc; do
-	ln -sf "$(pwd)/files/lib/pbr/$mod" "$patch_dir/$mod"
-done
-
-# Copy pbr.uc to the patch directory. The sed converts any remaining
-# ES import statements for fs/uci/ubus to require() calls so the mock
-# framework can intercept them through the module cache.
-sed \
-	-e "s|import { readfile, writefile, popen, stat, unlink, open, glob, mkdir, mkstemp, access, dirname, lsdir } from 'fs';|let _fs = require('fs'), readfile = _fs.readfile, writefile = _fs.writefile, popen = _fs.popen, stat = _fs.stat, unlink = _fs.unlink, open = _fs.open, glob = _fs.glob, mkdir = _fs.mkdir, mkstemp = _fs.mkstemp, access = _fs.access, dirname = _fs.dirname, lsdir = _fs.lsdir;|" \
-	-e "s|import { cursor } from 'uci';|let _uci = require('uci'), cursor = _uci.cursor;|" \
-	-e "s|import { connect } from 'ubus';|let _ubus = require('ubus'), connect = _ubus.connect;|" \
-	./files/lib/pbr/pbr.uc > "$patch_dir/pbr.uc.tmp"
-
-# ucode does NOT hoist function declarations — a function body that references
-# another function defined later in the file gets a null binding.  Fix this by
-# pre-declaring every top-level function with `let` and converting the
-# `function name(` declarations to `name = function(` assignments so that all
-# closures share the same (pre-declared) binding.
-#
-# The conversion also adds `;` after the closing `}` of each converted
-# function, since `name = function() { ... }` is an expression statement
-# that requires a terminating semicolon.
-awk '
-  # First pass (via ARGV manipulation): collect top-level function names
-  NR == FNR {
-    if (match($0, /^function ([a-zA-Z_][a-zA-Z0-9_]*)[\t ]*\(/, m))
-      names[m[1]] = 1
-    next
-  }
-  # Second pass: emit patched file
-  # After the use-strict line, inject forward declarations
-  /^'\''use strict'\''/ {
-    print
-    n = asorti(names, sorted)
-    if (n > 0) {
-      printf "let "
-      for (i = 1; i <= n; i++) {
-        if (i > 1) printf ", "
-        printf "%s", sorted[i]
-      }
-      printf ";\n"
-    }
-    next
-  }
-  # Convert top-level function declarations to assignments and track braces
-  /^function [a-zA-Z_][a-zA-Z0-9_]*[\t ]*\(/ {
-    sub(/^function /, "")
-    match($0, /^[a-zA-Z_][a-zA-Z0-9_]*/)
-    name = substr($0, RSTART, RLENGTH)
-    $0 = name " = function" substr($0, RSTART + RLENGTH)
-    in_func_assign = 1
-    depth = 0
-    # Count braces on this line
-    for (ci = 1; ci <= length($0); ci++) {
-      ch = substr($0, ci, 1)
-      if (ch == "{") depth++
-      else if (ch == "}") depth--
-    }
-    if (depth == 0) { $0 = $0 ";"; in_func_assign = 0 }
-    print
-    next
-  }
-  in_func_assign {
-    for (ci = 1; ci <= length($0); ci++) {
-      ch = substr($0, ci, 1)
-      if (ch == "{") depth++
-      else if (ch == "}") depth--
-    }
-    if (depth == 0) { $0 = $0 ";"; in_func_assign = 0 }
-    print
-    next
-  }
-  { print }
-' "$patch_dir/pbr.uc.tmp" "$patch_dir/pbr.uc.tmp" > "$patch_dir/pbr.uc"
-rm -f "$patch_dir/pbr.uc.tmp"
-
-trap "rm -rf '$patch_dir'" EXIT
-
-# Search paths: patched pbr.uc first, then tests/lib (for mocklib), then original source
-ucode="ucode -S -L$patch_dir -L./tests/lib -L./files/lib/pbr"
+# Search paths: tests/lib (for mocklib), then the production modules. pbr.uc reaches
+# fs, uci and ubus through require(), which mocklib intercepts in the module cache.
+ucode="ucode -S -L./tests/lib -L./files/lib/pbr"
 
 extract_sections() {
 	local file=$1
@@ -327,6 +237,28 @@ for shellscript in \
 		n_fails=$((n_fails + 1))
 	fi
 done
+
+# ── ucode syntax compatibility ────────────────────────────
+#
+# check-ucode-syntax.sh only means something on the oldest ucode pbr supports, and
+# refuses a newer one, while this suite runs on any ucode. So it takes its own
+# interpreter, and is skipped when none is given.
+
+printf "\n##\n## Checking syntax against the oldest supported ucode\n##\n\n"
+name="check-ucode-syntax.sh"
+printf "%s %s " "$name" "${line:${#name}}"
+if [ -z "$PBR_UCODE_OLDEST" ]; then
+	printf "SKIP (PBR_UCODE_OLDEST not set)\n"
+else
+	n_tests=$((n_tests + 1))
+	if tests/check-ucode-syntax.sh "$PBR_UCODE_OLDEST" >/dev/null 2>&1; then
+		printf "OK\n"
+	else
+		printf "FAILED\n"
+		tests/check-ucode-syntax.sh "$PBR_UCODE_OLDEST" # run again to show output
+		n_fails=$((n_fails + 1))
+	fi
+fi
 
 printf "\nRan %d tests, %d okay, %d failures\n" $n_tests $((n_tests - n_fails)) $n_fails
 exit $n_fails
