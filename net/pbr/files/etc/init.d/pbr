@@ -9,7 +9,7 @@ USE_PROCD=1
 
 if type extra_command 1>/dev/null 2>&1; then
 	extra_command 'dnsprefetch' "Resolves the domain names in policies again, for a cron job
-		Empties the domain sets first if dnsprefetch_flush_sets is set"
+		Rebuilds the domain sets from fresh answers if dnsprefetch_flush_sets is set"
 	extra_command 'enable_forward' "Enables forwarding from LAN > WAN, can be used if the router is stuck in Disabled state"
 	extra_command 'netifd' "Netifd extensions operations"
 	extra_command 'on_interface_reload' "Run service on indicated interface reload"
@@ -25,7 +25,7 @@ else
 # shellcheck disable=SC2034
 	EXTRA_HELP="
 \tdnsprefetch\tResolves the domain names in policies again, for a cron job
-\t\tEmpties the domain sets first if dnsprefetch_flush_sets is set
+\t\tRebuilds the domain sets from fresh answers if dnsprefetch_flush_sets is set
 \tstatus\tDisplays current routing mode and nft file paths
 \t\tUse '-d' option for detailed diagnostic output
 \tsupport\tShow diagnostic info and mask sensitive data
